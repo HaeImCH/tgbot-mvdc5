@@ -1,0 +1,64 @@
+# 複製為 config.toml 後填寫。執行：cargo run --release -- config.toml
+
+# https://my.telegram.org → API development tools
+api_id = 0
+api_hash = ""
+
+# 帳號類型：
+#   "bot"  —（預設）用 bot token 登入。上傳上限 2000 MiB，超過會分割。
+#   "user" — 用使用者帳號登入。Premium 帳號上傳上限 4000 MiB（4 GB 檔案不必分割）。
+#            第一次需要互動式登入（輸入驗證碼 / 兩步驟驗證密碼）：
+#              tgbot_mvdc5 login config.toml
+#            之後再用 systemd 正常啟動。請使用與 bot 不同的 session_file。
+#            使用者模式只處理：
+#              • 你自己轉傳 / 傳送到「儲存的訊息」(Saved Messages) 的檔案
+#              • allowed_user_ids 中的使用者私訊給你的檔案（其他人一律忽略）
+#            並且不會回覆任何文字訊息。
+account = "bot"
+# phone = "+886912345678"     # 使用者模式的手機號碼（留空則登入時詢問）
+
+# bot token（僅 bot 模式）：直接填在 bot_token，或放在 bot_token_file（預設 token.txt）
+# bot_token = "123456:ABC..."
+bot_token_file = "token.txt"
+
+session_file = "bot.session"
+temp_dir = "./tmp"
+
+# bot 模式：只允許這些 user id 使用（空陣列 = 所有人都能用）
+# 使用者模式：除了「儲存的訊息」外，額外處理這些 user id 私訊的檔案（空陣列 = 只處理儲存的訊息）
+allowed_user_ids = []
+
+# SOCKS5 代理（所有 Telegram 連線都會經過它，包含多條下載/上傳連線）
+# proxy = "socks5://127.0.0.1:1080"
+# proxy = "socks5://user:pass@host:1080"
+
+use_ipv6 = false
+
+[transfer]
+download_connections = 4      # 從來源 DC 下載的並行連線數
+upload_connections = 4        # 上傳到 bot 所在 DC 的並行連線數
+download_chunk_kb = 512       # 每個 getFile 請求大小（最大 512；4 的倍數且能整除 1024）
+pipeline_depth = 8            # 每條連線同時進行中的請求數；在途資料 = 連線數 × 深度 × 512KB（4×8×512KB = 16 MB，與 Telegram Desktop 相同）
+request_timeout_secs = 15     # 連線持續此秒數沒有任何回應 → 丟棄連線、重新排入並重連（處理無聲卡死）
+connect_timeout_secs = 20     # 建立連線 / SOCKS5 握手 / 匯入授權逾時
+stall_timeout_secs = 60       # 所有連線都沒有進度超過此秒數 → 全部重連（須大於 connect + request 逾時）
+max_stall_restarts = 5        # 連續停滯重連上限
+max_part_retries = 5          # 單一分塊非網路錯誤的重試上限
+max_reconnects_per_worker = 20
+max_flood_wait_secs = 600     # FLOOD_WAIT 超過此秒數就放棄
+use_media_dc = true           # 跨 DC 下載走該 DC 的媒體專用位址（與官方 Telegram Desktop 相同，速度約快 4 倍）
+auth_per_connection = true    # 每條下載連線使用獨立授權（Telegram 限流以授權計算，可大幅減少 FLOOD_WAIT）
+premium_wait_strategy = "reconnect"   # FLOOD_PREMIUM_WAIT："reconnect" 或 "wait"
+reconnect_jitter_ms = 500
+max_concurrent_jobs = 1       # 同時處理的檔案數，其餘排隊
+split_size_mb = 4000          # 超過上傳上限的檔案分割成 .001/.002…；每部分最大 MiB（會自動限制在帳號上限：一般 2000 / Premium 4000）
+
+[status]
+edit_interval_secs = 3        # 狀態訊息更新間隔（避免編輯訊息被限流）
+
+[warm]
+# 預先連線並保持在線：新任務不必再做金鑰交換 / 授權 / SOCKS5 握手，可立即開始下載
+enabled = true
+dcs = [1, 2, 3, 4, 5]         # 要保持連線的 DC（含 bot 所在 DC 時，上傳也會更快開始）
+connections_per_dc = 4        # 每個 DC 的閒置連線數（建議與 download_connections 相同）
+keepalive_secs = 30           # 保活 ping 間隔；失效的連線會自動替換

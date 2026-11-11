@@ -1,0 +1,25 @@
+[package]
+name = "tgbot_mvdc5"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+grammers-client = { version = "0.12", features = ["proxy"] }
+grammers-mtproto = "0.12"
+grammers-mtsender = { version = "0.12", features = ["proxy"] }
+grammers-session = "0.12"
+grammers-tl-types = "0.12"
+libc = "0.2.191"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Vendored grammers-mtsender 0.12.0 with one change: `Sender::enqueue_body` made
+# public so a single raw connection can keep several requests in flight
+# (pipelined upload.getFile / saveBigFilePart). See vendor/grammers-mtsender/PATCH.md.
+[patch.crates-io]
+grammers-mtsender = { path = "vendor/grammers-mtsender" }
