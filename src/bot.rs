@@ -148,6 +148,18 @@ impl Bot {
         self.net.cfg.account == AccountType::User
     }
 
+    /// Who asked for this job, for the logs.
+    fn requester(&self, msg: &Message) -> String {
+        let peer = msg.peer_id();
+        if self.is_user_mode() && (peer == PeerId::self_user() || peer.bare_id() == Some(self.net.me_id)) {
+            return "Saved Messages".to_string();
+        }
+        match msg.sender_id().and_then(|p| p.bare_id()) {
+            Some(id) => format!("user {id}"),
+            None => "unknown user".to_string(),
+        }
+    }
+
     pub async fn handle(self: Arc<Self>, msg: Message) {
         if !self.accept(&msg).await {
             return;
@@ -179,6 +191,14 @@ impl Bot {
         };
 
         let home = self.net.home_dc;
+        info!(
+            "file request: {} ({}) on DC{} from {} (message {})",
+            info.name,
+            human_bytes(info.size),
+            info.dc,
+            self.requester(&msg),
+            msg.id()
+        );
         if info.dc == home && !self.net.cfg.transfer.reupload_same_dc {
             // Our own re-uploaded files are already filtered out in accept() (they
             // reply to a source we are moving), so it is safe to answer here.
@@ -256,6 +276,13 @@ impl Bot {
         let elapsed = human_duration(progress.started.elapsed().as_secs());
         let final_text = match result {
             Ok(done) => {
+                info!(
+                    "job done: {} sent to {} in {elapsed} ({} piece(s), now on {})",
+                    progress.file_name,
+                    self.requester(&msg),
+                    done.pieces.len().max(1),
+                    done.new_dc.map_or("unknown DC".to_string(), |dc| format!("DC{dc}"))
+                );
                 let avg = progress.total() as f64 / progress.started.elapsed().as_secs_f64().max(0.001);
                 let where_now = match done.new_dc {
                     Some(dc) if dc == home && done.all_same_dc => format!("✅ 新檔案已位於 DC{dc}"),
@@ -278,7 +305,7 @@ impl Bot {
                 )
             }
             Err(e) => {
-                error!("job failed for {}: {e:#}", progress.file_name);
+                error!("job failed for {} from {}: {e:#}", progress.file_name, self.requester(&msg));
                 let chain: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
                 let details = if chain.is_empty() {
                     String::new()
