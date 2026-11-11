@@ -118,6 +118,12 @@ impl Plan {
     }
 }
 
+impl Ctx {
+    fn is_home_download(&self) -> bool {
+        self.dc == self.net.home_dc && matches!(self.dir, Direction::Download { .. })
+    }
+}
+
 struct Ctx {
     net: Arc<Net>,
     dc: i32,
@@ -345,7 +351,12 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
 
             // ---- connection ----
             if conn.is_none() {
-                match ctx.net.take(ctx.dc, id).await {
+                let conn_res = if ctx.is_home_download() {
+                    ctx.net.take_download(ctx.dc, id).await
+                } else {
+                    ctx.net.take(ctx.dc, id).await
+                };
+                match conn_res {
                     Ok(s) => {
                         ctx.progress.active_conns.fetch_add(1, Ordering::Relaxed);
                         conn = Some(s);
@@ -576,7 +587,8 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
     if let Some(s) = conn {
         ctx.progress.active_conns.fetch_sub(1, Ordering::Relaxed);
         // Healthy connection after a clean finish (nothing in flight) -> keep it warm.
-        if result.is_ok() && inflight.is_empty() {
+        // Home-DC download connections use the media address: not for the pool.
+        if result.is_ok() && inflight.is_empty() && !ctx.is_home_download() {
             ctx.net.give_back(ctx.dc, id, s);
         }
     }

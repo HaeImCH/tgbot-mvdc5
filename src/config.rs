@@ -105,6 +105,8 @@ pub struct TransferConfig {
     /// Desktop's media cluster) instead of the regular API front-end.
     pub use_media_dc: bool,
     pub auth_per_connection: bool,
+    /// 檔案已位於本帳號的 DC 時仍重新下載並上傳（預設關閉，直接回覆「已位於 DCx」）。
+    pub reupload_same_dc: bool,
     /// 超過上傳上限的檔案會分割成多個部分，每部分最大 MiB
     /// （實際上限：bot / 一般帳號 2000 MiB，Premium 帳號 4000 MiB）
     pub split_size_mb: u64,
@@ -153,6 +155,7 @@ impl Default for TransferConfig {
             auth_per_connection: true,
             use_media_dc: true,
             split_size_mb: 2000,
+            reupload_same_dc: false,
         }
     }
 }

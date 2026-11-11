@@ -179,7 +179,7 @@ impl Bot {
         };
 
         let home = self.net.home_dc;
-        if info.dc == home {
+        if info.dc == home && !self.net.cfg.transfer.reupload_same_dc {
             // Our own re-uploaded files are already filtered out in accept() (they
             // reply to a source we are moving), so it is safe to answer here.
             let _ = msg

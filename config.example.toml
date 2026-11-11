@@ -51,6 +51,7 @@ auth_per_connection = true    # 每條下載連線使用獨立授權（Telegram 
 premium_wait_strategy = "reconnect"   # FLOOD_PREMIUM_WAIT："reconnect" 或 "wait"
 reconnect_jitter_ms = 500
 max_concurrent_jobs = 1       # 同時處理的檔案數，其餘排隊
+reupload_same_dc = false      # true：檔案已在本帳號的 DC 也重新下載並上傳（false：回覆「已位於 DCx」並略過）
 split_size_mb = 4000          # 超過上傳上限的檔案分割成 .001/.002…；每部分最大 MiB（會自動限制在帳號上限：一般 2000 / Premium 4000）
 
 [status]

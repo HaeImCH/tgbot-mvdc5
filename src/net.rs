@@ -118,8 +118,11 @@ impl Net {
         *self.media.write().unwrap() = found;
     }
 
-    fn media_addr(&self, dc_id: i32) -> Option<SocketAddr> {
-        if dc_id == self.home_dc || self.media_broken.lock().unwrap().contains(&dc_id) {
+    /// Media address for transfer connections. The home DC only uses it for
+    /// downloads (`reupload_same_dc`); uploads go to the regular address like
+    /// the official clients do.
+    fn media_addr(&self, dc_id: i32, download: bool) -> Option<SocketAddr> {
+        if (dc_id == self.home_dc && !download) || self.media_broken.lock().unwrap().contains(&dc_id) {
             return None;
         }
         self.media.read().unwrap().get(&dc_id).copied()
@@ -140,7 +143,10 @@ impl Net {
         } else {
             opt.ipv4.into()
         };
-        let address = media.then(|| self.media_addr(dc_id)).flatten().unwrap_or(regular);
+        let address = media
+            .then(|| self.media.read().unwrap().get(&dc_id).copied())
+            .flatten()
+            .unwrap_or(regular);
         Ok(match &self.cfg.proxy {
             Some(proxy) => ServerAddr::Proxied {
                 address,
@@ -375,9 +381,24 @@ impl Net {
     /// Uses the DC's media address when known; if that fails, the DC is marked
     /// and this and later connections use the regular address.
     pub async fn open(&self, dc_id: i32, slot: usize) -> Result<RawSender> {
+        self.open_conn(dc_id, slot, false).await
+    }
+
+    /// Like `take`, for download workers. Downloads from the home DC
+    /// (`reupload_same_dc`) bypass the warm pool, which holds regular-address
+    /// connections for uploads, and use the media address instead.
+    pub async fn take_download(&self, dc_id: i32, slot: usize) -> Result<RawSender> {
+        if dc_id == self.home_dc {
+            self.open_conn(dc_id, slot, true).await
+        } else {
+            self.take(dc_id, slot).await
+        }
+    }
+
+    async fn open_conn(&self, dc_id: i32, slot: usize, download: bool) -> Result<RawSender> {
         let key = self.auth_key(dc_id, slot).await?;
-        let via_media = self.media_addr(dc_id).is_some();
-        match self.open_at(dc_id, key, true).await {
+        let via_media = self.media_addr(dc_id, download).is_some();
+        match self.open_at(dc_id, key, via_media).await {
             Err(e) if via_media && e.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc()) => {
                 if self.media_broken.lock().unwrap().insert(dc_id) {
                     warn!("DC{dc_id}: media address failed ({e:#}); falling back to the regular address");
