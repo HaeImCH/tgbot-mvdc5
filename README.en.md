@@ -39,6 +39,7 @@ We recommend `user` mode with a Telegram Premium account. This mode gives the hi
 - If a file is larger than the upload limit, tgbot_mvdc5 divides it into parts. The part names end in `.001`, `.002`, and so on.
 - tgbot_mvdc5 keeps idle connections to each DC. Thus a new transfer can start immediately.
 - tgbot_mvdc5 records each request in the log. The log shows the sender, the file name, and the result.
+- You can cancel a queued or running job. In `bot` mode, press the "❌ 取消" button under the status message. In `user` mode, reply "取消" (or `cancel`) to the status message. Send `/cancel` to cancel all jobs in the chat.
 
 ### 2.3 Measured speeds
 

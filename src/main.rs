@@ -217,6 +217,9 @@ async fn main() -> Result<()> {
                 Ok(Update::NewMessage(msg)) => {
                     tokio::spawn(bot.clone().handle(msg.into_inner()));
                 }
+                Ok(Update::CallbackQuery(q)) => {
+                    tokio::spawn(bot.clone().on_callback(q));
+                }
                 Ok(_) => {}
                 Err(e) => {
                     error!("update error: {e}");

@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use grammers_client::Client;
+use grammers_client::message::{InputMessage, ReplyMarkup};
 use grammers_session::types::PeerRef;
+use grammers_tl_types as tl;
 use tracing::debug;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -236,12 +238,18 @@ impl Progress {
 }
 
 /// Periodically edits the status message. Abort the task to stop it.
+///
+/// `markup` (the cancel button) is re-sent on every edit, because an edit
+/// without a reply markup removes the keyboard. `footer` is appended to the
+/// rendered text (the cancel hint in user mode, where buttons are not allowed).
 pub async fn run_reporter(
     client: Client,
     peer: PeerRef,
     msg_id: i32,
     progress: std::sync::Arc<Progress>,
     interval: Duration,
+    markup: Option<tl::enums::ReplyMarkup>,
+    footer: &'static str,
 ) {
     let mut last_text = String::new();
     let mut last_sample: Option<(Instant, u64, Stage)> = None;
@@ -262,11 +270,11 @@ pub async fn run_reporter(
         if blocked_until.is_some_and(|t| t > now) {
             continue;
         }
-        let text = progress.render(speed);
+        let text = progress.render(speed) + footer;
         if text == last_text {
             continue;
         }
-        match edit(&client, peer, msg_id, &text).await {
+        match edit(&client, peer, msg_id, &text, markup.as_ref()).await {
             EditResult::Ok => last_text = text,
             EditResult::Flood(secs) => blocked_until = Some(now + Duration::from_secs(secs)),
             EditResult::Err => {}
@@ -281,8 +289,19 @@ pub enum EditResult {
 }
 
 /// Edit a message; never fails the job (MESSAGE_NOT_MODIFIED / flood are swallowed).
-pub async fn edit(client: &Client, peer: PeerRef, msg_id: i32, text: &str) -> EditResult {
-    match client.edit_message(peer, msg_id, text).await {
+/// Without `markup`, any inline keyboard on the message is removed.
+pub async fn edit(
+    client: &Client,
+    peer: PeerRef,
+    msg_id: i32,
+    text: &str,
+    markup: Option<&tl::enums::ReplyMarkup>,
+) -> EditResult {
+    let mut m = InputMessage::new().text(text);
+    if let Some(raw) = markup {
+        m = m.reply_markup(ReplyMarkup { raw: raw.clone() });
+    }
+    match client.edit_message(peer, msg_id, m).await {
         Ok(()) => EditResult::Ok,
         Err(e) if e.is("MESSAGE_NOT_MODIFIED") => EditResult::Ok,
         Err(grammers_client::InvocationError::Rpc(r)) if r.code == 420 => {

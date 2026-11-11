@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grammers_client::media::{Downloadable, Media};
-use grammers_client::message::{InputMessage, Message};
+use grammers_client::message::{Button, InputMessage, Message, ReplyMarkup};
+use grammers_client::update::CallbackQuery;
 use grammers_session::types::{PeerId, PeerKind, PeerRef};
 use grammers_tl_types as tl;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::net::Net;
@@ -25,9 +26,39 @@ pub struct Bot {
     waiting: AtomicUsize,
     /// Ids of original messages we are moving / recently moved (user-mode loop guard).
     sources: std::sync::Mutex<std::collections::HashSet<i32>>,
-    /// Jobs in flight (queued or running), for cleanup on shutdown:
-    /// source msg id -> (chat, status message id, temp file).
-    active: std::sync::Mutex<std::collections::HashMap<i32, (PeerRef, i32, PathBuf, String)>>,
+    /// Jobs in flight (queued or running), for cancelling and for cleanup on
+    /// shutdown, by source message id.
+    active: std::sync::Mutex<std::collections::HashMap<i32, ActiveJob>>,
+}
+
+struct ActiveJob {
+    /// Chat of the source message (as `msg.peer_id()` reports it).
+    chat: PeerId,
+    peer: PeerRef,
+    status_id: i32,
+    tmp: PathBuf,
+    job: String,
+    cancel: Arc<Notify>,
+}
+
+/// Callback data prefix of the cancel button: `cancel:<source message id>`.
+const CANCEL_DATA: &str = "cancel:";
+/// User accounts cannot send inline buttons, so user mode cancels by reply.
+const USER_CANCEL_HINT: &str = "\n\n↩️ 回覆此訊息「取消」即可取消任務";
+
+/// Decrements the queue counter when a job leaves the queue (or is cancelled in it).
+struct Waiting<'a>(&'a AtomicUsize);
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Text that asks to cancel: `/cancel` (also `/cancel@bot`), `取消` or `cancel`.
+fn is_cancel_text(text: &str) -> bool {
+    let t = text.trim();
+    let cmd = t.split('@').next().unwrap_or(t);
+    cmd.eq_ignore_ascii_case("/cancel") || t == "取消" || t.eq_ignore_ascii_case("cancel")
 }
 
 /// What we know about the incoming file.
@@ -128,7 +159,7 @@ impl Bot {
             return;
         }
         info!("shutdown: interrupting {} unfinished job(s)", jobs.len());
-        for (_, (peer, status_id, tmp, job)) in jobs {
+        for (_, ActiveJob { peer, status_id, tmp, job, .. }) in jobs {
             info!("shutdown: interrupted {job}");
             match tokio::fs::remove_file(&tmp).await {
                 Ok(()) => info!("shutdown: removed {}", tmp.display()),
@@ -138,10 +169,65 @@ impl Bot {
             let text = "⚠️ 服務正在重新啟動，此任務已中斷，暫存檔已清除。\n\n請稍後重新轉傳檔案再試一次。";
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
-                status::edit(&self.net.client, peer, status_id, text),
+                status::edit(&self.net.client, peer, status_id, text, None),
             )
             .await;
         }
+    }
+
+    /// Cancel the jobs in `chat` that `pick(source id, job)` selects. They stop at
+    /// their next await point and clean up themselves. Returns the number cancelled.
+    fn cancel_jobs(&self, chat: PeerId, pick: impl Fn(i32, &ActiveJob) -> bool) -> usize {
+        let mut active = self.active.lock().unwrap();
+        let ids: Vec<i32> = active
+            .iter()
+            .filter(|(id, j)| j.chat == chat && pick(**id, j))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            // Removed here so a second press does not report success again.
+            if let Some(j) = active.remove(id) {
+                info!("cancel requested: {}", j.job);
+                j.cancel.notify_one();
+            }
+        }
+        ids.len()
+    }
+
+    /// The cancel button under a status message (bot mode).
+    pub async fn on_callback(self: Arc<Self>, q: CallbackQuery) {
+        let source = std::str::from_utf8(q.data())
+            .ok()
+            .and_then(|d| d.strip_prefix(CANCEL_DATA))
+            .and_then(|id| id.parse::<i32>().ok());
+        let Some(source) = source else {
+            let _ = q.answer().send().await;
+            return;
+        };
+        let n = self.cancel_jobs(q.peer_id(), |id, _| id == source);
+        let text = if n > 0 { "🚫 已取消任務" } else { "此任務已經結束" };
+        if let Err(e) = q.answer().text(text).send().await {
+            debug!("cannot answer callback query: {e}");
+        }
+    }
+
+    /// A text message asking to cancel: a reply to a status message cancels that
+    /// job; a bare `/cancel` cancels every job in the chat. Returns false when
+    /// the text is not a cancel request.
+    async fn handle_cancel_text(&self, msg: &Message, text: &str) -> bool {
+        if !is_cancel_text(text) {
+            return false;
+        }
+        let chat = msg.peer_id();
+        let n = match msg.reply_to_message_id() {
+            Some(r) => self.cancel_jobs(chat, |_, j| j.status_id == r),
+            None if text.starts_with('/') => self.cancel_jobs(chat, |_, _| true),
+            None => return false,
+        };
+        if !self.is_user_mode() && n == 0 {
+            let _ = msg.reply("目前沒有可以取消的任務。").await;
+        }
+        true
     }
 
     fn is_user_mode(&self) -> bool {
@@ -174,6 +260,9 @@ impl Bot {
         let user_mode = self.is_user_mode();
 
         let text = msg.text().trim().to_string();
+        if msg.media().is_none() && self.handle_cancel_text(&msg, &text).await {
+            return;
+        }
         let Some(media) = msg.media() else {
             // Never answer text in user mode (would talk in your chats / loop on itself).
             if !user_mode
@@ -230,7 +319,19 @@ impl Bot {
             }
         };
 
-        let status_msg = match msg.reply("⏳ 已收到檔案，準備處理中…").await {
+        // Bot mode: a cancel button (re-sent with every status edit). User mode:
+        // a hint to reply instead, since user accounts cannot send buttons.
+        let (markup, footer) = if user_mode {
+            (None, USER_CANCEL_HINT)
+        } else {
+            let button = Button::data("❌ 取消", format!("{CANCEL_DATA}{source_id}"));
+            (Some(ReplyMarkup::from_buttons(&[vec![button]]).raw), "")
+        };
+        let mut first = InputMessage::new().text(format!("⏳ 已收到檔案，準備處理中…{footer}"));
+        if let Some(raw) = &markup {
+            first = first.reply_markup(ReplyMarkup { raw: raw.clone() });
+        }
+        let status_msg = match msg.reply(first).await {
             Ok(m) => m,
             Err(e) => {
                 warn!("{job}: cannot send status message, giving up: {e}");
@@ -252,10 +353,18 @@ impl Bot {
             msg.peer_id().bare_id_unchecked(),
             msg.id()
         ));
-        self.active
-            .lock()
-            .unwrap()
-            .insert(source_id, (peer, status_msg.id(), tmp.clone(), job.clone()));
+        let cancel = Arc::new(Notify::new());
+        self.active.lock().unwrap().insert(
+            source_id,
+            ActiveJob {
+                chat: msg.peer_id(),
+                peer,
+                status_id: status_msg.id(),
+                tmp: tmp.clone(),
+                job: job.clone(),
+                cancel: cancel.clone(),
+            },
+        );
 
         let progress = Arc::new(Progress::new(info.name.clone(), info.size, info.dc, home));
         let reporter = tokio::spawn(status::run_reporter(
@@ -264,6 +373,8 @@ impl Bot {
             status_msg.id(),
             progress.clone(),
             Duration::from_secs(self.net.cfg.status.edit_interval_secs.max(1)),
+            markup,
+            footer,
         ));
 
         // Queue.
@@ -271,11 +382,22 @@ impl Bot {
         let running = self.net.cfg.transfer.max_concurrent_jobs - self.jobs.available_permits();
         let ahead = if self.jobs.available_permits() == 0 { waiting_before + running } else { 0 };
         progress.set_stage(Stage::Queued { ahead });
-        let permit = self.jobs.acquire().await;
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-
-        let result = self.process(&msg, peer, info, &tmp, &progress).await;
-        drop(permit);
+        let work = async {
+            let permit = {
+                let _waiting = Waiting(&self.waiting);
+                self.jobs.acquire().await
+            };
+            let result = self.process(&msg, peer, info, &tmp, &progress).await;
+            drop(permit);
+            result
+        };
+        // Cancelling drops `work`: a queued job leaves the queue, a running one
+        // stops its transfer (the worker JoinSet aborts its tasks on drop).
+        let result = tokio::select! {
+            biased;
+            _ = cancel.notified() => None,
+            r = work => Some(r),
+        };
         let _ = tokio::fs::remove_file(&tmp).await;
         self.active.lock().unwrap().remove(&source_id);
         reporter.abort();
@@ -283,7 +405,14 @@ impl Bot {
         let elapsed = human_duration(progress.started.elapsed().as_secs());
         let outcome: String;
         let final_text = match result {
-            Ok(done) => {
+            None => {
+                outcome = format!("job cancelled: {job} after {elapsed}");
+                format!(
+                    "🚫 任務已取消\n\n📄 檔案：{}\n🕒 耗時：{elapsed}\n\n暫存檔已清除。",
+                    progress.file_name
+                )
+            }
+            Some(Ok(done)) => {
                 let pieces = done.pieces.len().max(1);
                 let location = match done.new_dc {
                     _ if !done.all_same_dc => "pieces on different DCs".to_string(),
@@ -313,7 +442,7 @@ impl Bot {
                     human_bytes(avg as u64),
                 )
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 error!("job failed: {job} after {elapsed}: {e:#}");
                 outcome = String::new();
                 let chain: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
@@ -332,7 +461,7 @@ impl Bot {
         // Final edit: retry a few times so the user is not left with a stale message.
         let mut edited = false;
         for _ in 0..3 {
-            match status::edit(&self.net.client, peer, status_msg.id(), &final_text).await {
+            match status::edit(&self.net.client, peer, status_msg.id(), &final_text, None).await {
                 status::EditResult::Ok => {
                     edited = true;
                     break;
@@ -790,5 +919,15 @@ mod tests {
         assert!(t.contains(r#"cat "a b.mkv.001" "a b.mkv.002" > "a b.mkv""#), "{t}");
         assert!(t.contains(r#"copy /b "a b.mkv.001"+"a b.mkv.002" "a b.mkv""#), "{t}");
         assert_eq!(split_instructions("x", &[], 1), "");
+    }
+
+    #[test]
+    fn cancel_text() {
+        for t in ["/cancel", "/cancel@mvdc_bot", " 取消 ", "Cancel", "/CANCEL"] {
+            assert!(is_cancel_text(t), "{t}");
+        }
+        for t in ["", "取消了", "please cancel", "/cancelled"] {
+            assert!(!is_cancel_text(t), "{t}");
+        }
     }
 }
