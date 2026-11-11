@@ -40,6 +40,7 @@ We recommend `user` mode with a Telegram Premium account. This mode gives the hi
 - tgbot_mvdc5 keeps idle connections to each DC. Thus a new transfer can start immediately.
 - tgbot_mvdc5 records each request in the log. The log shows the sender, the file name, and the result.
 - You can cancel a queued or running job. In `bot` mode, press the "❌ 取消" button under the status message. In `user` mode, reply "取消" (or `cancel`) to the status message. Send `/cancel` to cancel all jobs in the chat.
+- You can send a message link instead of a file, for example `https://t.me/channel/123`. tgbot_mvdc5 moves the file of that message. This also works for channels that do not allow forwarding. For a private link (`https://t.me/c/…`), the account must be a member of the chat. A bot account may not be able to read the message of a channel that it is not in. In this case, use `user` mode.
 
 ### 2.3 Measured speeds
 

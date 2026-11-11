@@ -61,6 +61,60 @@ fn is_cancel_text(text: &str) -> bool {
     cmd.eq_ignore_ascii_case("/cancel") || t == "取消" || t.eq_ignore_ascii_case("cancel")
 }
 
+/// A link to one message.
+#[derive(Debug, PartialEq)]
+enum MsgLink {
+    /// `t.me/<username>/<id>` (also `t.me/<username>/<topic>/<id>`, `t.me/s/...`).
+    Public { username: String, id: i32 },
+    /// `t.me/c/<channel id>/<id>` (also with a topic id): needs membership.
+    Private { channel: i64, id: i32 },
+}
+
+/// Parse a message whose whole text is one t.me message link.
+fn parse_link(text: &str) -> Option<MsgLink> {
+    let t = text.trim();
+    let t = t
+        .strip_prefix("https://")
+        .or_else(|| t.strip_prefix("http://"))
+        .unwrap_or(t);
+    let (host, path) = t.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    if !matches!(host, "t.me" | "telegram.me" | "telegram.dog") {
+        return None;
+    }
+    let path = path.split(['?', '#']).next()?;
+    let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.first() == Some(&"s") {
+        parts.remove(0);
+    }
+    let id: i32 = match parts.as_slice() {
+        [_, .., last] if parts.len() >= 2 && parts.len() <= 4 => last.parse().ok()?,
+        _ => return None,
+    };
+    if id <= 0 {
+        return None;
+    }
+    let name = parts[0];
+    let middle = &parts[1..parts.len() - 1];
+    if name == "c" {
+        // c/<channel>/<id> or c/<channel>/<topic>/<id>
+        let [channel, rest @ ..] = middle else { return None };
+        if rest.len() > 1 || rest.iter().any(|p| p.parse::<i32>().is_err()) {
+            return None;
+        }
+        return Some(MsgLink::Private { channel: channel.parse().ok()?, id });
+    }
+    // <username>/<id> or <username>/<topic>/<id>
+    let valid = name.len() >= 4
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.starts_with(|c: char| c.is_ascii_alphabetic());
+    if !valid || middle.len() > 1 || middle.iter().any(|p| p.parse::<i32>().is_err()) {
+        return None;
+    }
+    Some(MsgLink::Public { username: name.to_string(), id })
+}
+
 /// What we know about the incoming file.
 pub(crate) struct FileInfo {
     pub(crate) name: String,
@@ -80,7 +134,7 @@ enum FileKind {
 }
 
 const HELP: &str = "👋 歡迎使用 DC 搬移機器人\n\n\
-把任何含有檔案的訊息轉傳給我（影片、文件、照片、音訊…）。\n\
+把任何含有檔案的訊息轉傳給我（影片、文件、照片、音訊…），或直接傳送訊息連結（例如 https://t.me/頻道/123，禁止轉傳的頻道也可以）。\n\
 如果檔案不在本機器人所在的 DC，我會用多條連線從原本的 DC 下載，再重新上傳到本機器人所在的 DC，然後把新檔案傳回給你。\n\n\
 處理過程中我會持續更新狀態訊息，讓你知道目前的進度。";
 
@@ -263,7 +317,30 @@ impl Bot {
         if msg.media().is_none() && self.handle_cancel_text(&msg, &text).await {
             return;
         }
-        let Some(media) = msg.media() else {
+        // A message link (t.me/<channel>/<id>, t.me/c/<id>/<id>): move the file
+        // of the linked message. Works for channels that forbid forwarding too.
+        // Telegram attaches a link preview (WebPage media) to link messages.
+        let has_file = msg.media().is_some_and(|m| !matches!(m, Media::WebPage(_)));
+        let linked = match (has_file, parse_link(&text)) {
+            (false, Some(link)) => match self.fetch_linked(&link).await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    info!("link {link:?} from {} (message {}): {e:#}", self.requester(&msg), msg.id());
+                    let _ = msg.reply(format!("⚠️ 無法取得連結中的訊息：{e}")).await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+        let (src, src_peer) = match &linked {
+            Some((m, p)) => (m, Some(*p)),
+            None => (&msg, None),
+        };
+        let Some(media) = src.media() else {
+            if linked.is_some() {
+                let _ = msg.reply("⚠️ 連結中的訊息沒有檔案。").await;
+                return;
+            }
             // Never answer text in user mode (would talk in your chats / loop on itself).
             if !user_mode
                 && (text.starts_with("/start") || text.starts_with("/help") || !text.is_empty())
@@ -279,7 +356,7 @@ impl Bot {
         let info = match file_info(&media) {
             Some(i) => i,
             None => {
-                if !user_mode {
+                if !user_mode || linked.is_some() {
                     let _ = msg.reply("⚠️ 這則訊息的內容不是可搬移的檔案（僅支援文件、影片、音訊、照片、貼圖）。").await;
                 }
                 return;
@@ -289,7 +366,10 @@ impl Bot {
         let home = self.net.home_dc;
         // File names come from the sender: always log them escaped ({:?}) so a
         // name with newlines cannot forge log lines.
-        let job = format!("{:?} from {} (message {})", info.name, self.requester(&msg), msg.id());
+        let mut job = format!("{:?} from {} (message {})", info.name, self.requester(&msg), msg.id());
+        if linked.is_some() {
+            job.push_str(&format!(" via link {text:?}"));
+        }
         info!("file request: {job}, {} on DC{}", human_bytes(info.size), info.dc);
         if info.dc == home && !self.net.cfg.transfer.reupload_same_dc {
             // Our own re-uploaded files are already filtered out in accept() (they
@@ -347,6 +427,7 @@ impl Bot {
                 return;
             }
         };
+        let src_peer = src_peer.unwrap_or(peer);
 
         let tmp = self.net.cfg.temp_dir.join(format!(
             "{}_{}.part",
@@ -387,7 +468,7 @@ impl Bot {
                 let _waiting = Waiting(&self.waiting);
                 self.jobs.acquire().await
             };
-            let result = self.process(&msg, peer, info, &tmp, &progress).await;
+            let result = self.process(&msg, src, src_peer, peer, info, &tmp, &progress).await;
             drop(permit);
             result
         };
@@ -478,9 +559,52 @@ impl Bot {
         }
     }
 
+    /// Fetch the message a link points to, with a usable reference to its chat.
+    async fn fetch_linked(&self, link: &MsgLink) -> Result<(Message, PeerRef)> {
+        let client = &self.net.client;
+        let (peer, id) = match link {
+            MsgLink::Public { username, id } => {
+                let peer = client
+                    .resolve_username(username)
+                    .await
+                    .context("查詢使用者名稱失敗")?
+                    .ok_or_else(|| anyhow!("找不到 @{username}"))?;
+                let peer = peer
+                    .to_ref()
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow!("無法存取 @{username}"))?;
+                (peer, *id)
+            }
+            MsgLink::Private { channel, id } => {
+                use grammers_session::Session;
+                let pid = PeerId::channel(*channel).ok_or_else(|| anyhow!("連結格式錯誤"))?;
+                let peer = self
+                    .net
+                    .session
+                    .peer_ref(pid)
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow!("帳號尚未加入此私人頻道或群組"))?;
+                (peer, *id)
+            }
+        };
+        let m = client
+            .get_messages_by_id(peer, &[id])
+            .await
+            .context("讀取訊息失敗")?
+            .pop()
+            .flatten()
+            .ok_or_else(|| anyhow!("訊息不存在或已被刪除"))?;
+        Ok((m, peer))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn process(
         &self,
         msg: &Message,
+        src: &Message,
+        src_peer: PeerRef,
         peer: PeerRef,
         info: FileInfo,
         tmp: &PathBuf,
@@ -514,11 +638,12 @@ impl Bot {
         progress.set_stage(Stage::Downloading { dc: info.dc });
         let client = self.net.client.clone();
         let msg_id = msg.id();
+        let src_id = src.id();
         let refresher: transfer::Refresher = Box::new(move || {
             let client = client.clone();
             Box::pin(async move {
                 let m = client
-                    .get_messages_by_id(peer, &[msg_id])
+                    .get_messages_by_id(src_peer, &[src_id])
                     .await?
                     .pop()
                     .flatten()
@@ -613,8 +738,8 @@ impl Bot {
 
         // ---- send ----
         progress.set_stage(Stage::Sending);
-        let caption = msg.text().to_string();
-        let entities = msg.fmt_entities().cloned().unwrap_or_default();
+        let caption = src.text().to_string();
+        let entities = src.fmt_entities().cloned().unwrap_or_default();
         let total = uploaded.len();
         let mut new_dcs = Vec::with_capacity(total);
         for (i, piece) in uploaded.iter().enumerate() {
@@ -919,6 +1044,28 @@ mod tests {
         assert!(t.contains(r#"cat "a b.mkv.001" "a b.mkv.002" > "a b.mkv""#), "{t}");
         assert!(t.contains(r#"copy /b "a b.mkv.001"+"a b.mkv.002" "a b.mkv""#), "{t}");
         assert_eq!(split_instructions("x", &[], 1), "");
+    }
+
+    #[test]
+    fn message_links() {
+        let public = |u: &str, id| Some(MsgLink::Public { username: u.into(), id });
+        assert_eq!(parse_link("https://t.me/testnoforward/2"), public("testnoforward", 2));
+        assert_eq!(parse_link(" t.me/testnoforward/2?single "), public("testnoforward", 2));
+        assert_eq!(parse_link("https://t.me/s/testnoforward/2"), public("testnoforward", 2));
+        assert_eq!(parse_link("https://telegram.me/some_chan/10/25"), public("some_chan", 25));
+        assert_eq!(
+            parse_link("https://t.me/c/1234567890/55"),
+            Some(MsgLink::Private { channel: 1234567890, id: 55 })
+        );
+        assert_eq!(
+            parse_link("https://t.me/c/1234567890/3/55"),
+            Some(MsgLink::Private { channel: 1234567890, id: 55 })
+        );
+        assert_eq!(parse_link("https://t.me/testnoforward"), None);
+        assert_eq!(parse_link("https://t.me/joinchat/abcdef"), None);
+        assert_eq!(parse_link("https://t.me/+abcdef/2"), None);
+        assert_eq!(parse_link("https://example.com/a/2"), None);
+        assert_eq!(parse_link("see https://t.me/testnoforward/2"), None);
     }
 
     #[test]
