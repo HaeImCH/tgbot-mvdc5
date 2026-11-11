@@ -1,158 +1,255 @@
 # tgbot_mvdc5
 
-把 Telegram 檔案搬到你帳號所在 DC 的 Rust 服務。
+英文版請見 [README.en.md](README.en.md)。
 
-轉傳一個檔案給它，如果檔案不在本帳號的 DC（例如在 DC4，而帳號在 DC5），它會用多條連線從原本的 DC 下載，再重新上傳到本帳號的 DC，最後把新檔案傳回給你。整個過程會持續更新一則繁體中文的狀態訊息（階段、進度、下載／上傳速度）。
+## 1. 用途
 
-使用 [grammers](https://codeberg.org/Lonami/grammers) 0.12（MTProto layer 233）。
+tgbot_mvdc5 把 Telegram 檔案搬到你帳號所在的資料中心（DC）。
 
-## 功能
+Telegram 把每個檔案存放在一個 DC。檔案在其他 DC 時，從你所在的地區下載可能很慢。tgbot_mvdc5 從檔案所在的 DC 下載檔案。然後把檔案重新上傳到你帳號所在的 DC。然後把新檔案傳給你。
 
-- **兩種帳號模式**
-  - `bot`：用 bot token 登入，任何人（或 `allowed_user_ids` 中的人）私訊檔案給 bot 即可。上傳上限 2000 MiB。
-  - `user`：用你自己的帳號登入，處理你轉傳到「儲存的訊息」的檔案，以及 `allowed_user_ids` 中的使用者私訊給你的檔案。Premium 帳號上傳上限 4000 MiB。不會回覆任何文字訊息。
-- **多連線、管線化傳輸**：每條連線同時保有多個請求（預設 4 條 × 8 個 × 512 KB = 16 MB 在途，與 Telegram Desktop 相同）。
-- **媒體專用 DC 位址**：跨 DC 下載走 `help.getConfig` 裡的 `media_only` 位址（Telegram Desktop 的 media cluster 做法），連不上時自動退回一般位址。
-- **每條連線獨立授權**：Telegram 的下載限流以授權為單位，獨立授權可避免所有連線一起被限流。
-- **穩定性**：請求逾時、無聲卡死偵測（watchdog）、FLOOD_WAIT / FLOOD_PREMIUM_WAIT 處理、斷線重連（含隨機抖動與指數退避）、檔案參照過期時自動重新取得。
-- **大檔案分割**：超過帳號上傳上限的檔案會分割成 `.001`、`.002`… 並附上合併指令（`cat` / `copy /b`）。
-- **預熱連線池**：預先連線到各 DC 並定期 ping，新任務可立即開始。
-- **SOCKS5 代理**：所有連線（含多條下載／上傳連線）都經過代理，支援帳號密碼。
-- **同 DC 重新上傳**（可選）：`reupload_same_dc = true` 時，已在本帳號 DC 的檔案也會重新下載並上傳。
-- **清理**：啟動時清空暫存資料夾；收到 SIGTERM / Ctrl+C 時刪除未完成的暫存檔，並把狀態訊息改成「已中斷」。
-- **完整的記錄**：每個請求都會記錄來源、檔名（經過跳脫）與結果（完成、失敗、略過、中斷）。
+處理期間，tgbot_mvdc5 用一則狀態訊息顯示進度。狀態訊息使用繁體中文。
 
-## 實測速度
+## 2. 說明
 
-測試檔案：1.93 GB，位於 DC4，帳號在 DC5，伺服器在台北，經 SOCKS5 代理。
+### 2.1 帳號模式
 
-| 項目 | 速度 |
+tgbot_mvdc5 有兩種帳號模式：
+
+| 模式 | 登入方式 | 接受的檔案 | 上傳上限 |
+|---|---|---|---|
+| `bot` | bot token | 使用者在私訊中傳給 bot 的檔案 | 2000 MiB |
+| `user` | 你的 Telegram 帳號 | 「儲存的訊息」中的檔案，以及 `allowed_user_ids` 中的使用者私訊給你的檔案 | 4000 MiB（Premium） |
+
+在 `user` 模式下，tgbot_mvdc5 不回覆文字訊息。
+
+建議使用 `user` 模式，並使用 Telegram Premium 帳號。這樣速度最快：
+
+- Telegram 會限制 bot 帳號的下載速度。使用者帳號沒有這個限制。
+- Premium 帳號可以上傳最大 4000 MiB 的檔案。因此大部分檔案不需要分割。
+
+### 2.2 功能
+
+- 每次傳輸使用 4 條連線。你可以變更這個數字。
+- 每條連線同時送出 8 個請求。你可以變更這個數字。
+- 每條下載連線使用自己的授權。這樣可以減少 FLOOD_WAIT 錯誤。
+- 下載時，tgbot_mvdc5 使用該 DC 的媒體專用位址。Telegram Desktop 也使用這個位址。
+- 媒體專用位址連不上時，tgbot_mvdc5 改用一般位址。
+- tgbot_mvdc5 可以透過 SOCKS5 代理連線。所有連線都經過代理。
+- 檔案大於上傳上限時，tgbot_mvdc5 把檔案分割成多個部分。各部分的檔名以 `.001`、`.002` 等結尾。
+- tgbot_mvdc5 對每個 DC 保持閒置連線。因此新的傳輸可以立即開始。
+- tgbot_mvdc5 在記錄中記下每個請求。記錄顯示傳送者、檔名與結果。
+
+### 2.3 實測速度
+
+測試條件：1.93 GB 的檔案位於 DC4，帳號位於 DC5，伺服器位於台北，使用 SOCKS5 代理。每次傳輸使用 4 條連線，每條連線同時 8 個請求。
+
+#### bot 帳號與 Premium 使用者帳號比較
+
+| 操作 | `bot` 模式 | `user` 模式（Premium） |
+|---|---|---|
+| 從 DC4 下載 | 約 14.6 MB/s，1385 次 FLOOD_WAIT | 約 64 MB/s，0 次 FLOOD_WAIT |
+| 上傳到 DC5 | 約 12 MB/s，每 400 MB 有 20–44 次 FLOOD_WAIT | 約 24–27 MB/s，0 次 FLOOD_WAIT |
+| 1.93 GB 檔案總耗時 | 約 5 分鐘（推算） | 約 1 分 50 秒（實測） |
+| 單一檔案上傳上限 | 2000 MiB | 4000 MiB |
+
+使用 Premium 帳號的 `user` 模式，下載約快 4 倍，上傳約快 2 倍。
+
+#### Premium 使用者帳號的其他測量
+
+| 操作 | 速度 |
 |---|---|
-| 從 DC4 下載（媒體位址，4 × 8） | 約 64 MB/s，0 次 FLOOD_WAIT |
-| 從 DC4 下載（一般位址，改版前） | 約 13 MB/s，約 1500 次 FLOOD_WAIT |
-| 從 DC5 下載（同 DC，媒體位址） | 約 104 MB/s |
-| 上傳到 DC5 | 約 25–27 MB/s |
+| 從 DC4 下載，一般位址（`use_media_dc = false`） | 約 13 MB/s |
+| 從 DC5 下載，媒體專用位址（`reupload_same_dc = true`） | 約 104 MB/s |
 
-已知限制：
+### 2.4 限制
 
-- **上傳約 27 MB/s 是 Telegram 端的上限**：增加連線數、同時上傳多個檔案、換帳號、不走代理、改用媒體位址都一樣，伺服器本身的上傳頻寬遠高於此。
-- **bot 帳號的下載仍會被限流**（約 14 MB/s，大量 FLOOD_WAIT），即使走媒體位址也一樣。大檔案建議用 `user` 模式。
-- **DC3 沒有媒體位址**，從 DC3 下載仍走一般位址。
+- 上傳速度上限約 27 MB/s，這是 Telegram 端的限制。增加連線數不會提高速度。
+- Telegram 會限制 bot 帳號的下載速度。大檔案請使用 `user` 模式與 Premium 帳號。
+- DC3 沒有媒體專用位址。從 DC3 下載比較慢。
 
-## 建置
+## 3. 建置程序
 
-```sh
-cargo build --release
-cargo test
-```
+1. 安裝 Rust 工具鏈。
+2. 編譯程式：
 
-交叉編譯到 Linux amd64（需要 [cross](https://github.com/cross-rs/cross) 與 Docker）：
+   ```sh
+   cargo build --release
+   ```
 
-```sh
-CROSS_CONTAINER_OPTS="--platform linux/amd64" \
-  cross build --release --target x86_64-unknown-linux-gnu
-```
+3. 執行測試：
 
-`vendor/grammers-mtsender` 是 grammers-mtsender 0.12.0 加上一個小修改（把 `Sender::enqueue_body` 設為 `pub`，供管線化傳輸使用），透過 `Cargo.toml` 的 `[patch.crates-io]` 套用，詳見 `vendor/grammers-mtsender/PATCH.md`。
+   ```sh
+   cargo test
+   ```
 
-## 設定
+4. 要編譯 Linux amd64 版本，先安裝 `cross` 與 Docker。然後執行這個指令：
 
-```sh
-cp config.example.toml config.toml
-```
+   ```sh
+   CROSS_CONTAINER_OPTS="--platform linux/amd64" \
+     cross build --release --target x86_64-unknown-linux-gnu
+   ```
 
-至少要填：
+備註：`vendor/grammers-mtsender` 是修改過的 grammers-mtsender 0.12.0。修改內容是把 `Sender::enqueue_body` 設為公開。請參閱 `vendor/grammers-mtsender/PATCH.md`。
 
-- `api_id`、`api_hash`：到 <https://my.telegram.org> → API development tools 申請。
-- `bot` 模式：bot token 放在 `token.txt`（或直接填 `bot_token`）。
-- `user` 模式：`account = "user"`，並使用與 bot 不同的 `session_file`。
+## 4. 設定程序
 
-常用設定（完整說明見 `config.example.toml`）：
+1. 複製範例檔：
 
-| 設定 | 說明 |
+   ```sh
+   cp config.example.toml config.toml
+   ```
+
+2. 到 <https://my.telegram.org> 取得 `api_id` 與 `api_hash`。
+3. 把 `api_id` 與 `api_hash` 寫入 `config.toml`。
+4. `bot` 模式：把 bot token 放入 `token.txt`。
+5. `user` 模式：設定 `account = "user"`。
+6. `user` 模式：設定一個與 bot 不同的 `session_file`。
+7. 使用代理時，設定 `proxy = "socks5://user:password@host:port"`。
+
+警告：不要把 `config.toml`、`token.txt`、`user.toml` 或 `*.session` 放入 git。session 檔可以完整存取帳號。
+
+### 4.1 常用設定
+
+| 設定 | 作用 |
 |---|---|
-| `allowed_user_ids` | bot 模式：允許使用的 user id（空 = 所有人）。user 模式：除了儲存的訊息外，額外處理這些人私訊的檔案。 |
-| `proxy` | `socks5://user:pass@host:port` |
-| `[transfer] download_connections` / `upload_connections` | 並行連線數（預設 4） |
-| `[transfer] pipeline_depth` | 每條連線同時進行中的請求數（預設 8） |
-| `[transfer] use_media_dc` | 下載走媒體專用位址（預設開啟） |
-| `[transfer] reupload_same_dc` | 已在本帳號 DC 的檔案也重新上傳（預設關閉） |
-| `[transfer] split_size_mb` | 分割時每部分的大小上限 |
-| `[transfer] max_concurrent_jobs` | 同時處理的檔案數，其餘排隊（預設 1） |
-| `[warm]` | 預熱連線池：要保持連線的 DC 與每個 DC 的連線數 |
+| `allowed_user_ids` | `bot` 模式：可以使用 bot 的使用者。空清單表示所有使用者都可以使用。`user` 模式：tgbot_mvdc5 也會搬移這些使用者私訊的檔案。 |
+| `[transfer] download_connections` | 下載連線數。預設為 4。 |
+| `[transfer] upload_connections` | 上傳連線數。預設為 4。 |
+| `[transfer] pipeline_depth` | 每條連線同時進行的請求數。預設為 8。 |
+| `[transfer] use_media_dc` | 下載時使用媒體專用位址。預設為 `true`。 |
+| `[transfer] reupload_same_dc` | 已在帳號所在 DC 的檔案也重新搬移。預設為 `false`。 |
+| `[transfer] split_size_mb` | 每個部分的最大大小，單位 MiB。 |
+| `[transfer] max_concurrent_jobs` | 同時搬移的檔案數。預設為 1。 |
+| `[warm]` | 要保持閒置連線的 DC，以及每個 DC 的連線數。 |
 
-`config.toml`、`token.txt`、`user.toml`、`*.session` 都已加入 `.gitignore`，請勿提交。session 檔等同於帳號的完整登入憑證。
+所有設定請參閱 `config.example.toml`。
 
-## 執行
+## 5. 操作程序
 
-```sh
-# bot 模式
-tgbot_mvdc5 config.toml
+### 5.1 以 bot 模式啟動
 
-# user 模式：第一次先互動式登入（驗證碼、兩步驟驗證密碼），之後正常啟動
-tgbot_mvdc5 login user.toml
-tgbot_mvdc5 user.toml
-```
+1. 啟動程式：
 
-user 模式尚未登入時，程式會以結束碼 78 離開（systemd 設定 `RestartPreventExitStatus=78`，不會無限重啟）。
+   ```sh
+   tgbot_mvdc5 config.toml
+   ```
 
-記錄等級用 `RUST_LOG` 控制，建議：
+### 5.2 以 user 模式啟動
 
-```sh
-RUST_LOG=info,grammers=warn,grammers_mtsender::updates_receiver=error
-```
+1. 登入一次：
 
-## 以 systemd 部署
+   ```sh
+   tgbot_mvdc5 login user.toml
+   ```
 
-範例（user 模式；bot 模式把 `user.toml` 換成 `config.toml` 即可，兩者可同時執行）：
+2. 輸入 Telegram 傳來的驗證碼。
+3. 帳號有兩步驟驗證時，輸入密碼。
+4. 啟動程式：
 
-```ini
-[Unit]
-Description=Telegram DC mover (user account)
-After=network-online.target
-Wants=network-online.target
+   ```sh
+   tgbot_mvdc5 user.toml
+   ```
 
-[Service]
-User=tgbot
-Group=tgbot
-WorkingDirectory=/opt/tgbot_mvdc5
-ExecStart=/opt/tgbot_mvdc5/tgbot_mvdc5 /opt/tgbot_mvdc5/user.toml
-Restart=always
-RestartSec=5
-RestartPreventExitStatus=78
-Environment=RUST_LOG=info,grammers=warn,grammers_mtsender::updates_receiver=error
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/tgbot_mvdc5
-PrivateTmp=true
+備註：帳號尚未登入時，程式以結束碼 78 停止。
 
-[Install]
-WantedBy=multi-user.target
-```
+### 5.3 搬移檔案
 
-重新部署前請先確認暫存資料夾裡沒有 `*.part` 檔案（代表有任務正在進行），否則重啟會中斷該任務。
+1. 傳送或轉傳檔案：
+   - `bot` 模式：傳給 bot。
+   - `user` 模式：轉傳到「儲存的訊息」。
+2. 查看狀態訊息。狀態訊息顯示階段、進度與速度。
+3. 傳輸完成時，tgbot_mvdc5 以回覆的方式傳送新檔案。
 
-## 效能測試（bench）
+### 5.4 設定記錄等級
 
-在不影響正在執行的服務的情況下測試不同的連線配置（使用 session 檔的副本，不會傳送任何訊息）：
+1. 設定 `RUST_LOG` 環境變數。建議使用這個值：
 
-```sh
-# 下載：<儲存的訊息 id> <連線數> <深度> <分塊 KB> <MiB>
-tgbot_mvdc5 bench user.toml 242880 4 8 512 300
+   ```sh
+   RUST_LOG=info,grammers=warn,grammers_mtsender::updates_receiver=error
+   ```
 
-# 上傳：把隨機資料上傳到本帳號的 DC，但不附加到任何訊息
-tgbot_mvdc5 bench user.toml upload 8 4 400
-```
+## 6. 安裝為 systemd 服務
 
-診斷用環境變數：
+1. 把程式與設定檔複製到 `/opt/tgbot_mvdc5`。
+2. 建立單元檔，例如 `/etc/systemd/system/tgbot_mvdc5-user.service`：
+
+   ```ini
+   [Unit]
+   Description=Telegram DC mover (user account)
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   User=tgbot
+   Group=tgbot
+   WorkingDirectory=/opt/tgbot_mvdc5
+   ExecStart=/opt/tgbot_mvdc5/tgbot_mvdc5 /opt/tgbot_mvdc5/user.toml
+   Restart=always
+   RestartSec=5
+   RestartPreventExitStatus=78
+   Environment=RUST_LOG=info,grammers=warn,grammers_mtsender::updates_receiver=error
+   NoNewPrivileges=true
+   ProtectSystem=strict
+   ReadWritePaths=/opt/tgbot_mvdc5
+   PrivateTmp=true
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+3. `bot` 模式：建立第二個單元檔。用 `config.toml` 取代 `user.toml`。
+4. 啟動服務：
+
+   ```sh
+   systemctl daemon-reload
+   systemctl enable --now tgbot_mvdc5-user
+   ```
+
+注意：重新啟動服務前，確認暫存資料夾中沒有 `*.part` 檔案。`*.part` 檔案表示傳輸正在進行。重新啟動會中斷傳輸。
+
+## 7. 速度測試程序（bench）
+
+bench 指令不會影響正在執行的服務。它使用 session 檔的副本。它不傳送任何訊息。
+
+1. 測試下載時，使用這個指令：
+
+   ```sh
+   tgbot_mvdc5 bench user.toml <訊息_id> <連線數> <深度> <分塊_KB> <MiB>
+   ```
+
+   檔案必須在「儲存的訊息」中。例如：
+
+   ```sh
+   tgbot_mvdc5 bench user.toml 242880 4 8 512 300
+   ```
+
+2. 測試上傳時，使用這個指令：
+
+   ```sh
+   tgbot_mvdc5 bench user.toml upload <連線數> <深度> <MiB>
+   ```
+
+   上傳使用隨機資料。沒有訊息使用這些資料，所以 Telegram 會刪除它們。
+
+### 7.1 診斷用變數
 
 | 變數 | 作用 |
 |---|---|
-| `BENCH_DC_OPTIONS=1` | 列出 `help.getConfig` 的所有 DC 位址（含 `media_only`） |
-| `BENCH_NO_MEDIA_DC=1` | 不使用媒體位址，用來比較 |
-| `BENCH_FLOOD_RECONNECT=1` | FLOOD_WAIT 時改為重連而不是等待 |
-| `BENCH_CDN_PROBE=1` | 檢查檔案是否會被導向 CDN DC |
+| `BENCH_DC_OPTIONS=1` | 顯示 `help.getConfig` 中所有的 DC 位址。 |
+| `BENCH_NO_MEDIA_DC=1` | 停用媒體專用位址，用於比較。 |
+| `BENCH_FLOOD_RECONNECT=1` | 遇到 FLOOD_WAIT 時重新連線，不等待。 |
+| `BENCH_CDN_PROBE=1` | 顯示 Telegram 是否把檔案導向 CDN DC。 |
 
-## 授權
+## 8. 故障排除
 
-未指定。
+| 問題 | 可能原因 | 處理方式 |
+|---|---|---|
+| 程式以結束碼 78 停止。 | `user` 帳號尚未登入。 | 執行 5.2 節的步驟。 |
+| 下載很慢，記錄中有很多 FLOOD_WAIT 錯誤。 | 帳號是 bot，或該 DC 沒有媒體專用位址。 | 使用 `user` 模式。確認 `use_media_dc = true`。 |
+| 記錄顯示 `falling back to the regular address`。 | 媒體專用位址連不上。 | 不需要處理。tgbot_mvdc5 會使用一般位址。 |
+| 狀態訊息顯示傳輸已中斷。 | 傳輸期間服務重新啟動。 | 重新傳送檔案。 |
+
+## 9. 授權
+
+本軟體採用 MIT 授權。請參閱 [LICENSE](LICENSE)。
