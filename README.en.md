@@ -19,7 +19,7 @@ tgbot_mvdc5 has two account modes:
 | Mode | Login | Files that it accepts | Upload limit |
 |---|---|---|---|
 | `bot` | Bot token | Files that users send to the bot in a private chat | 2000 MiB |
-| `user` | Your Telegram account | Files in your Saved Messages, and files from the users in `allowed_user_ids` | 4000 MiB (Premium) |
+| `user` | Your Telegram account | Forwarded files and message links in your Saved Messages, and from the users in `allowed_user_ids`. It ignores stickers and files that are not forwarded. | 4000 MiB (Premium) |
 
 In `user` mode, tgbot_mvdc5 does not reply to text messages.
 

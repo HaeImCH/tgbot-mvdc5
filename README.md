@@ -19,7 +19,7 @@ tgbot_mvdc5 有兩種帳號模式：
 | 模式 | 登入方式 | 接受的檔案 | 上傳上限 |
 |---|---|---|---|
 | `bot` | bot token | 使用者在私訊中傳給 bot 的檔案 | 2000 MiB |
-| `user` | 你的 Telegram 帳號 | 「儲存的訊息」中的檔案，以及 `allowed_user_ids` 中的使用者私訊給你的檔案 | 4000 MiB（Premium） |
+| `user` | 你的 Telegram 帳號 | 「儲存的訊息」中，以及 `allowed_user_ids` 中的使用者私訊給你的轉傳檔案與訊息連結。不處理貼圖與非轉傳的檔案。 | 4000 MiB（Premium） |
 
 在 `user` 模式下，tgbot_mvdc5 不回覆文字訊息。
 

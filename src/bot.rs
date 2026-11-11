@@ -353,6 +353,24 @@ impl Bot {
             return;
         };
 
+        // User mode moves only forwarded messages and message links: files you
+        // send or upload directly, and stickers, are left alone.
+        if user_mode {
+            let sticker = matches!(media, Media::Sticker(_));
+            if sticker && linked.is_some() {
+                let _ = msg.reply("⚠️ 連結中的訊息是貼圖，不會搬移。").await;
+                return;
+            }
+            if sticker || (linked.is_none() && msg.forward_header().is_none()) {
+                debug!(
+                    "user mode: ignoring message {} ({})",
+                    msg.id(),
+                    if sticker { "sticker" } else { "not forwarded" }
+                );
+                return;
+            }
+        }
+
         let info = match file_info(&media) {
             Some(i) => i,
             None => {
