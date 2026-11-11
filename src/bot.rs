@@ -27,7 +27,7 @@ pub struct Bot {
     sources: std::sync::Mutex<std::collections::HashSet<i32>>,
     /// Jobs in flight (queued or running), for cleanup on shutdown:
     /// source msg id -> (chat, status message id, temp file).
-    active: std::sync::Mutex<std::collections::HashMap<i32, (PeerRef, i32, PathBuf)>>,
+    active: std::sync::Mutex<std::collections::HashMap<i32, (PeerRef, i32, PathBuf, String)>>,
 }
 
 /// What we know about the incoming file.
@@ -84,8 +84,7 @@ impl Bot {
         if self.is_user_mode() {
             // Saved Messages: the chat with ourselves. Only we can post there, so do
             // not rely on the `out` flag (forwarded messages may not carry it).
-            let saved_messages = peer == PeerId::self_user() || peer.bare_id() == Some(self.net.me_id);
-            if saved_messages {
+            if self.is_saved_messages(peer) {
                 let reply_to = msg.reply_to_message_id();
                 info!(
                     "saved message {} received: out={} media={} reply_to={reply_to:?}",
@@ -129,7 +128,8 @@ impl Bot {
             return;
         }
         info!("shutdown: interrupting {} unfinished job(s)", jobs.len());
-        for (_, (peer, status_id, tmp)) in jobs {
+        for (_, (peer, status_id, tmp, job)) in jobs {
+            info!("shutdown: interrupted {job}");
             match tokio::fs::remove_file(&tmp).await {
                 Ok(()) => info!("shutdown: removed {}", tmp.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -148,15 +148,22 @@ impl Bot {
         self.net.cfg.account == AccountType::User
     }
 
-    /// Who asked for this job, for the logs.
+    /// The chat with ourselves (user mode).
+    fn is_saved_messages(&self, peer: PeerId) -> bool {
+        peer == PeerId::self_user() || peer.bare_id() == Some(self.net.me_id)
+    }
+
+    /// Who asked for this job, for the logs: id plus @username when known.
     fn requester(&self, msg: &Message) -> String {
-        let peer = msg.peer_id();
-        if self.is_user_mode() && (peer == PeerId::self_user() || peer.bare_id() == Some(self.net.me_id)) {
+        if self.is_user_mode() && self.is_saved_messages(msg.peer_id()) {
             return "Saved Messages".to_string();
         }
-        match msg.sender_id().and_then(|p| p.bare_id()) {
-            Some(id) => format!("user {id}"),
-            None => "unknown user".to_string(),
+        let Some(id) = msg.sender_id().and_then(|p| p.bare_id()) else {
+            return "unknown user".to_string();
+        };
+        match msg.sender().and_then(|p| p.username().map(str::to_string)) {
+            Some(u) => format!("user {id} (@{u})"),
+            None => format!("user {id}"),
         }
     }
 
@@ -191,24 +198,24 @@ impl Bot {
         };
 
         let home = self.net.home_dc;
-        info!(
-            "file request: {} ({}) on DC{} from {} (message {})",
-            info.name,
-            human_bytes(info.size),
-            info.dc,
-            self.requester(&msg),
-            msg.id()
-        );
+        // File names come from the sender: always log them escaped ({:?}) so a
+        // name with newlines cannot forge log lines.
+        let job = format!("{:?} from {} (message {})", info.name, self.requester(&msg), msg.id());
+        info!("file request: {job}, {} on DC{}", human_bytes(info.size), info.dc);
         if info.dc == home && !self.net.cfg.transfer.reupload_same_dc {
             // Our own re-uploaded files are already filtered out in accept() (they
             // reply to a source we are moving), so it is safe to answer here.
-            let _ = msg
+            info!("skipped {job}: already on DC{home}");
+            if let Err(e) = msg
                 .reply(format!(
                     "✅ 此檔案已經位於 DC{home}（與目前帳號相同），不需要搬移。\n\n📄 {}\n📦 {}",
                     info.name,
                     human_bytes(info.size)
                 ))
-                .await;
+                .await
+            {
+                warn!("{job}: cannot send reply: {e}");
+            }
             return;
         }
         let source_id = msg.id();
@@ -226,7 +233,7 @@ impl Bot {
         let status_msg = match msg.reply("⏳ 已收到檔案，準備處理中…").await {
             Ok(m) => m,
             Err(e) => {
-                warn!("cannot send status message: {e}");
+                warn!("{job}: cannot send status message, giving up: {e}");
                 forget();
                 return;
             }
@@ -234,7 +241,7 @@ impl Bot {
         let peer = match msg.peer_ref().await {
             Ok(Some(p)) => p,
             _ => {
-                warn!("peer not cached; cannot continue");
+                warn!("{job}: chat not in session cache, giving up");
                 forget();
                 return;
             }
@@ -248,7 +255,7 @@ impl Bot {
         self.active
             .lock()
             .unwrap()
-            .insert(source_id, (peer, status_msg.id(), tmp.clone()));
+            .insert(source_id, (peer, status_msg.id(), tmp.clone(), job.clone()));
 
         let progress = Arc::new(Progress::new(info.name.clone(), info.size, info.dc, home));
         let reporter = tokio::spawn(status::run_reporter(
@@ -274,15 +281,17 @@ impl Bot {
         reporter.abort();
 
         let elapsed = human_duration(progress.started.elapsed().as_secs());
+        let outcome: String;
         let final_text = match result {
             Ok(done) => {
-                info!(
-                    "job done: {} sent to {} in {elapsed} ({} piece(s), now on {})",
-                    progress.file_name,
-                    self.requester(&msg),
-                    done.pieces.len().max(1),
-                    done.new_dc.map_or("unknown DC".to_string(), |dc| format!("DC{dc}"))
-                );
+                let pieces = done.pieces.len().max(1);
+                let location = match done.new_dc {
+                    _ if !done.all_same_dc => "pieces on different DCs".to_string(),
+                    Some(dc) if dc == home => format!("DC{dc}"),
+                    Some(dc) => format!("DC{dc}, expected DC{home}"),
+                    None => "unknown DC".to_string(),
+                };
+                outcome = format!("job done: {job} delivered in {elapsed} ({pieces} piece(s), now on {location})");
                 let avg = progress.total() as f64 / progress.started.elapsed().as_secs_f64().max(0.001);
                 let where_now = match done.new_dc {
                     Some(dc) if dc == home && done.all_same_dc => format!("✅ 新檔案已位於 DC{dc}"),
@@ -305,7 +314,8 @@ impl Bot {
                 )
             }
             Err(e) => {
-                error!("job failed for {} from {}: {e:#}", progress.file_name, self.requester(&msg));
+                error!("job failed: {job} after {elapsed}: {e:#}");
+                outcome = String::new();
                 let chain: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
                 let details = if chain.is_empty() {
                     String::new()
@@ -320,12 +330,22 @@ impl Bot {
         };
         forget();
         // Final edit: retry a few times so the user is not left with a stale message.
+        let mut edited = false;
         for _ in 0..3 {
             match status::edit(&self.net.client, peer, status_msg.id(), &final_text).await {
-                status::EditResult::Ok => break,
+                status::EditResult::Ok => {
+                    edited = true;
+                    break;
+                }
                 status::EditResult::Flood(s) => tokio::time::sleep(Duration::from_secs(s.min(30))).await,
                 status::EditResult::Err => tokio::time::sleep(Duration::from_secs(2)).await,
             }
+        }
+        if !outcome.is_empty() {
+            info!("{outcome}");
+        }
+        if !edited {
+            warn!("{job}: could not update the final status message");
         }
     }
 
@@ -407,7 +427,7 @@ impl Bot {
                 .await?;
         }
         info!(
-            "downloaded {} ({}) from DC{} in {:?}",
+            "downloaded {:?} ({}) from DC{} in {:?}",
             info.name,
             human_bytes(real_size),
             info.dc,
@@ -422,7 +442,7 @@ impl Bot {
         let ranges = transfer::split_ranges(real_size, piece_size);
         let split = ranges.len() > 1;
         if split {
-            info!("{} is {}, splitting into {} pieces", info.name, human_bytes(real_size), ranges.len());
+            info!("{:?} is {}, splitting into {} pieces", info.name, human_bytes(real_size), ranges.len());
         }
         let mut uploaded = Vec::with_capacity(ranges.len());
         for (i, &(base, len)) in ranges.iter().enumerate() {
