@@ -6,3 +6,4 @@ config.toml
 /tmp/
 /*.bin
 user.toml
+/mutants.out*
