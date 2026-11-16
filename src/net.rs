@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grammers_client::Client;
@@ -67,8 +67,9 @@ pub struct Net {
     idle: std::sync::Mutex<HashMap<i32, Vec<(usize, Conn)>>>,
     /// dc_id -> media-only address (from help.getConfig), see module docs.
     media: std::sync::RwLock<HashMap<i32, SocketAddr>>,
-    /// DCs whose media address failed to connect; they use the regular one.
-    media_broken: std::sync::Mutex<std::collections::HashSet<i32>>,
+    /// DCs whose media address failed while the regular one worked; they use
+    /// the regular address until the cooldown ends.
+    media_broken: std::sync::Mutex<MediaBackoff>,
 }
 
 impl Net {
@@ -90,7 +91,7 @@ impl Net {
             keys: Mutex::new(HashMap::new()),
             idle: std::sync::Mutex::new(HashMap::new()),
             media: std::sync::RwLock::new(HashMap::new()),
-            media_broken: std::sync::Mutex::new(Default::default()),
+            media_broken: std::sync::Mutex::new(MediaBackoff::new(MEDIA_RETRY_AFTER)),
         }
     }
 
@@ -143,12 +144,29 @@ impl Net {
     /// downloads (`reupload_same_dc`); uploads go to the regular address like
     /// the official clients do.
     fn media_addr(&self, dc_id: i32, download: bool) -> Option<SocketAddr> {
-        if (dc_id == self.home_dc && !download)
-            || self.media_broken.lock().unwrap().contains(&dc_id)
-        {
+        if !wants_media(self.home_dc, dc_id, download) {
             return None;
         }
-        self.media.read().unwrap().get(&dc_id).copied()
+        let addr = self.media.read().unwrap().get(&dc_id).copied()?;
+        match self
+            .media_broken
+            .lock()
+            .unwrap()
+            .state(dc_id, Instant::now())
+        {
+            MediaState::Usable => Some(addr),
+            MediaState::Retry => {
+                info!("DC{dc_id}: retrying the media address");
+                Some(addr)
+            }
+            MediaState::Blocked => None,
+        }
+    }
+
+    /// A warm connection on the regular address while the media address is
+    /// usable again: drop it so a new one opens on the media address.
+    fn stale(&self, dc_id: i32, conn: &Conn) -> bool {
+        is_stale(conn.via_media, || self.media_addr(dc_id, false).is_some())
     }
 
     fn connect_timeout(&self) -> Duration {
@@ -324,8 +342,8 @@ impl Net {
             Some(v.swap_remove(i).1)
         });
         match warm {
-            Some(s) => Ok(s),
-            None => self.open(dc_id, slot).await,
+            Some(s) if !self.stale(dc_id, &s) => Ok(s),
+            _ => self.open(dc_id, slot).await,
         }
     }
 
@@ -380,15 +398,19 @@ impl Net {
                         }
                     });
                 }
-                let mut dead = 0;
+                let (mut dead, mut stale) = (0, 0);
                 while let Some(r) = set.join_next().await {
                     match r {
+                        Ok(Some((_, s))) if self.stale(dc, &s) => stale += 1,
                         Ok(Some((slot, s))) => self.give_back(dc, slot, s),
                         _ => dead += 1,
                     }
                 }
                 if dead > 0 {
                     warn!("warm pool DC{dc}: dropped {dead} dead connection(s)");
+                }
+                if stale > 0 {
+                    info!("warm pool DC{dc}: reopening {stale} connection(s) on the media address");
                 }
 
                 // Refill.
@@ -441,13 +463,23 @@ impl Net {
         let key = self.auth_key(dc_id, slot).await?;
         let via_media = self.media_addr(dc_id, download).is_some();
         match self.open_at(dc_id, key, via_media).await {
-            Err(e) if via_media && e.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc()) => {
-                if self.media_broken.lock().unwrap().insert(dc_id) {
+            Err(e) if retry_on_regular(via_media, &e) => {
+                let regular = self.open_at(dc_id, key, false).await;
+                // Only blame the media address when the regular one works; if
+                // both fail, the network is down and media stays preferred.
+                if regular.is_ok()
+                    && self
+                        .media_broken
+                        .lock()
+                        .unwrap()
+                        .mark(dc_id, Instant::now())
+                {
                     warn!(
-                        "DC{dc_id}: media address failed ({e:#}); falling back to the regular address"
+                        "DC{dc_id}: media address failed ({e:#}); using the regular address for {}s",
+                        MEDIA_RETRY_AFTER.as_secs()
                     );
                 }
-                self.open_at(dc_id, key, false).await
+                regular
             }
             r => r,
         }
@@ -489,5 +521,170 @@ impl OpenError {
     /// The server answered with an RPC error, i.e. the address itself works.
     pub fn is_rpc(&self) -> bool {
         matches!(self.0, InvocationError::Rpc(_))
+    }
+}
+
+/// Whether a connection to `dc_id` should go to the media address. The home
+/// DC only uses it for downloads; uploads go to the regular address like the
+/// official clients do.
+fn wants_media(home_dc: i32, dc_id: i32, download: bool) -> bool {
+    dc_id != home_dc || download
+}
+
+/// A warm connection is stale when it is on the regular address while the
+/// media address is usable. `media_usable` is only asked for regular ones.
+fn is_stale(via_media: bool, media_usable: impl FnOnce() -> bool) -> bool {
+    !via_media && media_usable()
+}
+
+/// After failing to open on the media address, try the regular one, unless
+/// the server answered with an RPC error (the address itself works then).
+fn retry_on_regular(via_media: bool, err: &anyhow::Error) -> bool {
+    via_media && err.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc())
+}
+
+/// How long a DC stays on its regular address after its media address failed.
+const MEDIA_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+#[derive(Debug, PartialEq, Eq)]
+enum MediaState {
+    /// Not marked: use the media address.
+    Usable,
+    /// Marked and cooling down: use the regular address.
+    Blocked,
+    /// The cooldown just ended (reported once): use the media address again.
+    Retry,
+}
+
+/// Per-DC cooldown after a media address failure. A failure is often a
+/// passing network problem, so the mark expires instead of lasting until
+/// restart.
+struct MediaBackoff {
+    cooldown: Duration,
+    until: HashMap<i32, Instant>,
+}
+
+impl MediaBackoff {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            until: HashMap::new(),
+        }
+    }
+
+    /// Mark `dc` as failed at `now`. Returns false if it was already marked
+    /// and still cooling down.
+    fn mark(&mut self, dc: i32, now: Instant) -> bool {
+        let fresh = self.until.get(&dc).is_none_or(|&t| now >= t);
+        if fresh {
+            self.until.insert(dc, now + self.cooldown);
+        }
+        fresh
+    }
+
+    fn state(&mut self, dc: i32, now: Instant) -> MediaState {
+        match self.until.get(&dc) {
+            None => MediaState::Usable,
+            Some(&t) if now < t => MediaState::Blocked,
+            Some(_) => {
+                self.until.remove(&dc);
+                MediaState::Retry
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COOL: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn home_dc_uses_media_only_for_downloads() {
+        assert!(!wants_media(4, 4, false));
+        assert!(wants_media(4, 4, true));
+        assert!(wants_media(4, 2, false));
+        assert!(wants_media(4, 2, true));
+    }
+
+    #[test]
+    fn only_regular_conns_with_usable_media_are_stale() {
+        assert!(is_stale(false, || true));
+        assert!(!is_stale(false, || false));
+        assert!(!is_stale(true, || panic!("not asked for media conns")));
+    }
+
+    fn rpc_error() -> anyhow::Error {
+        let rpc = grammers_mtsender::RpcError::from(tl::types::RpcError {
+            error_code: 401,
+            error_message: "AUTH_KEY_UNREGISTERED".into(),
+        });
+        anyhow::Error::new(OpenError(InvocationError::Rpc(rpc)))
+    }
+
+    fn io_error() -> anyhow::Error {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        anyhow::Error::new(OpenError(InvocationError::Session(Box::new(io))))
+    }
+
+    #[test]
+    fn media_failure_retries_on_regular_unless_rpc() {
+        assert!(retry_on_regular(true, &io_error()));
+        assert!(retry_on_regular(true, &anyhow!("連線到 DC4 逾時")));
+        assert!(!retry_on_regular(true, &rpc_error()));
+        assert!(!retry_on_regular(false, &io_error()));
+        assert!(!retry_on_regular(false, &anyhow!("timeout")));
+    }
+
+    #[test]
+    fn unmarked_dc_is_usable() {
+        let mut b = MediaBackoff::new(COOL);
+        assert_eq!(b.state(4, Instant::now()), MediaState::Usable);
+    }
+
+    #[test]
+    fn marked_dc_is_blocked_until_cooldown_ends() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        assert!(b.mark(4, t0));
+        assert_eq!(b.state(4, t0), MediaState::Blocked);
+        assert_eq!(
+            b.state(4, t0 + COOL - Duration::from_secs(1)),
+            MediaState::Blocked
+        );
+        assert_eq!(b.state(2, t0), MediaState::Usable);
+    }
+
+    #[test]
+    fn expired_mark_reports_retry_once_then_usable() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.mark(4, t0);
+        assert_eq!(b.state(4, t0 + COOL), MediaState::Retry);
+        assert_eq!(b.state(4, t0 + COOL), MediaState::Usable);
+    }
+
+    #[test]
+    fn mark_while_blocked_does_not_extend() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        assert!(b.mark(4, t0));
+        assert!(!b.mark(4, t0 + Duration::from_secs(10)));
+        assert_eq!(b.state(4, t0 + COOL), MediaState::Retry);
+    }
+
+    #[test]
+    fn mark_after_expiry_starts_new_cooldown() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.mark(4, t0);
+        let t1 = t0 + COOL + Duration::from_secs(5);
+        assert!(b.mark(4, t1));
+        assert_eq!(
+            b.state(4, t1 + COOL - Duration::from_secs(1)),
+            MediaState::Blocked
+        );
+        assert_eq!(b.state(4, t1 + COOL), MediaState::Retry);
     }
 }
