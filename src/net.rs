@@ -39,6 +39,15 @@ use crate::config::Config;
 
 pub type RawSender = Sender<Full, mtp::Encrypted>;
 
+/// A transfer connection, tagged with whether it was opened on the DC's
+/// media-only address. The tag is taken from the address actually dialed, so it
+/// stays correct for warm connections opened before the media list was loaded
+/// or before the media address was marked broken.
+pub struct Conn {
+    pub sender: RawSender,
+    pub via_media: bool,
+}
+
 pub struct Net {
     pub client: Client,
     pub session: Arc<SqliteSession>,
@@ -55,7 +64,7 @@ pub struct Net {
     /// export/import (concurrent exports cause AUTH_BYTES_INVALID, see telebackup).
     keys: Mutex<HashMap<(i32, usize), [u8; 256]>>,
     /// Warm pool: idle, initialized connections per DC, tagged with their slot.
-    idle: std::sync::Mutex<HashMap<i32, Vec<(usize, RawSender)>>>,
+    idle: std::sync::Mutex<HashMap<i32, Vec<(usize, Conn)>>>,
     /// dc_id -> media-only address (from help.getConfig), see module docs.
     media: std::sync::RwLock<HashMap<i32, SocketAddr>>,
     /// DCs whose media address failed to connect; they use the regular one.
@@ -146,7 +155,9 @@ impl Net {
         Duration::from_secs(self.cfg.transfer.connect_timeout_secs)
     }
 
-    fn server_addr(&self, dc_id: i32, media: bool) -> Result<ServerAddr> {
+    /// Address to dial, and whether it is the DC's media-only address (`media`
+    /// is only a preference: DCs without a known media address use the regular one).
+    fn server_addr(&self, dc_id: i32, media: bool) -> Result<(ServerAddr, bool)> {
         let opt = self
             .session
             .dc_option(dc_id)
@@ -157,17 +168,18 @@ impl Net {
         } else {
             opt.ipv4.into()
         };
-        let address = media
+        let media_address = media
             .then(|| self.media.read().unwrap().get(&dc_id).copied())
-            .flatten()
-            .unwrap_or(regular);
-        Ok(match &self.cfg.proxy {
+            .flatten();
+        let address = media_address.unwrap_or(regular);
+        let addr = match &self.cfg.proxy {
             Some(proxy) => ServerAddr::Proxied {
                 address,
                 proxy: proxy.clone(),
             },
             None => ServerAddr::Tcp { address },
-        })
+        };
+        Ok((addr, media_address.is_some()))
     }
 
     fn init<Q>(
@@ -264,7 +276,7 @@ impl Net {
     }
 
     async fn create_authorized_key(&self, dc_id: i32) -> Result<[u8; 256]> {
-        let addr = self.server_addr(dc_id, false)?;
+        let (addr, _) = self.server_addr(dc_id, false)?;
         let mut sender = connect(Full::new(), addr)
             .await
             .context("產生授權金鑰失敗")?;
@@ -306,7 +318,7 @@ impl Net {
 
     /// Get a connection for `slot`: the warm idle one of that slot if available
     /// (so each worker keeps its own authorization), otherwise open a new one.
-    pub async fn take(&self, dc_id: i32, slot: usize) -> Result<RawSender> {
+    pub async fn take(&self, dc_id: i32, slot: usize) -> Result<Conn> {
         let warm = self.idle.lock().unwrap().get_mut(&dc_id).and_then(|v| {
             let i = v.iter().position(|(s, _)| *s == slot)?;
             Some(v.swap_remove(i).1)
@@ -318,14 +330,14 @@ impl Net {
     }
 
     /// Return a healthy connection to the warm pool (one idle connection per slot).
-    pub fn give_back(&self, dc_id: i32, slot: usize, sender: RawSender) {
+    pub fn give_back(&self, dc_id: i32, slot: usize, conn: Conn) {
         if !self.cfg.warm.enabled || slot >= self.cfg.warm.connections_per_dc {
             return;
         }
         let mut idle = self.idle.lock().unwrap();
         let v = idle.entry(dc_id).or_default();
         if !v.iter().any(|(s, _)| *s == slot) {
-            v.push((slot, sender));
+            v.push((slot, conn));
         }
     }
 
@@ -362,7 +374,7 @@ impl Net {
                         let ping = tl::functions::Ping {
                             ping_id: rand::random(),
                         };
-                        match timeout(ping_timeout, s.invoke(&ping)).await {
+                        match timeout(ping_timeout, s.sender.invoke(&ping)).await {
                             Ok(Ok(_)) => Some((slot, s)),
                             _ => None,
                         }
@@ -410,14 +422,14 @@ impl Net {
     /// Open a new initialized connection to `dc_id` (bounded by connect timeout).
     /// Uses the DC's media address when known; if that fails, the DC is marked
     /// and this and later connections use the regular address.
-    pub async fn open(&self, dc_id: i32, slot: usize) -> Result<RawSender> {
+    pub async fn open(&self, dc_id: i32, slot: usize) -> Result<Conn> {
         self.open_conn(dc_id, slot, false).await
     }
 
     /// Like `take`, for download workers. Downloads from the home DC
     /// (`reupload_same_dc`) bypass the warm pool, which holds regular-address
     /// connections for uploads, and use the media address instead.
-    pub async fn take_download(&self, dc_id: i32, slot: usize) -> Result<RawSender> {
+    pub async fn take_download(&self, dc_id: i32, slot: usize) -> Result<Conn> {
         if dc_id == self.home_dc {
             self.open_conn(dc_id, slot, true).await
         } else {
@@ -425,7 +437,7 @@ impl Net {
         }
     }
 
-    async fn open_conn(&self, dc_id: i32, slot: usize, download: bool) -> Result<RawSender> {
+    async fn open_conn(&self, dc_id: i32, slot: usize, download: bool) -> Result<Conn> {
         let key = self.auth_key(dc_id, slot).await?;
         let via_media = self.media_addr(dc_id, download).is_some();
         match self.open_at(dc_id, key, via_media).await {
@@ -441,8 +453,8 @@ impl Net {
         }
     }
 
-    async fn open_at(&self, dc_id: i32, key: [u8; 256], media: bool) -> Result<RawSender> {
-        let addr = self.server_addr(dc_id, media)?;
+    async fn open_at(&self, dc_id: i32, key: [u8; 256], media: bool) -> Result<Conn> {
+        let (addr, via_media) = self.server_addr(dc_id, media)?;
         let fut = async {
             let mut sender = connect_with_auth(Full::new(), addr, key).await?;
             // InvokeWithoutUpdates: these raw senders discard updates, so they must
@@ -455,7 +467,7 @@ impl Net {
             Ok::<_, InvocationError>(sender)
         };
         match timeout(self.connect_timeout(), fut).await {
-            Ok(Ok(s)) => Ok(s),
+            Ok(Ok(sender)) => Ok(Conn { sender, via_media }),
             Ok(Err(e)) => Err(anyhow::Error::new(OpenError(e))),
             Err(_) => bail!("連線到 DC{dc_id} 逾時"),
         }

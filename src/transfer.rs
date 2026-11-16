@@ -33,7 +33,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::PremiumWaitStrategy;
-use crate::net::{Net, OpenError, RawSender};
+use crate::net::{Conn, Net, OpenError};
 use crate::status::Progress;
 
 pub const UPLOAD_PART: u64 = 512 * 1024;
@@ -138,6 +138,9 @@ struct Ctx {
     requests: AtomicU64,
     request_micros: AtomicU64,
     flood_waits: AtomicU64,
+    /// Connections acquired on the media-only address / the regular address.
+    media_acquired: AtomicU64,
+    regular_acquired: AtomicU64,
 }
 
 enum PartErr {
@@ -209,6 +212,8 @@ pub async fn run(
         requests: AtomicU64::new(0),
         request_micros: AtomicU64::new(0),
         flood_waits: AtomicU64::new(0),
+        media_acquired: AtomicU64::new(0),
+        regular_acquired: AtomicU64::new(0),
     });
     let started = Instant::now();
     let stall = Duration::from_secs(tcfg.stall_timeout_secs);
@@ -252,7 +257,7 @@ pub async fn run(
         };
         set.abort_all();
         while set.join_next().await.is_some() {}
-        progress.active_conns.store(0, Ordering::Relaxed);
+        progress.reset_conns();
 
         match outcome {
             Ok(true) => restarts = 0,
@@ -281,13 +286,17 @@ pub async fn run(
 
     let reqs = ctx.requests.load(Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64().max(0.001);
+    let is_download = matches!(ctx.dir, Direction::Download { .. });
+    let media = if is_download {
+        let m = ctx.media_acquired.load(Ordering::Relaxed);
+        let r = ctx.regular_acquired.load(Ordering::Relaxed);
+        format!(", media conns: {m}/{}", m + r)
+    } else {
+        String::new()
+    };
     info!(
-        "DC{dc} {}: {} in {secs:.1}s ({:.2} MB/s), {conns} conn(s), {reqs} requests (avg {:.0} ms), {} FLOOD_WAIT, separate auth: {}",
-        if matches!(ctx.dir, Direction::Download { .. }) {
-            "download"
-        } else {
-            "upload"
-        },
+        "DC{dc} {}: {} in {secs:.1}s ({:.2} MB/s), {conns} conn(s), {reqs} requests (avg {:.0} ms), {} FLOOD_WAIT, separate auth: {}{media}",
+        if is_download { "download" } else { "upload" },
         crate::status::human_bytes(plan.size),
         plan.size as f64 / secs / 1048576.0,
         ctx.request_micros.load(Ordering::Relaxed) as f64 / reqs.max(1) as f64 / 1000.0,
@@ -322,7 +331,7 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
     tokio::time::sleep(Duration::from_millis(id as u64 * 200) + jitter(tcfg.reconnect_jitter_ms))
         .await;
 
-    let mut conn: Option<RawSender> = None;
+    let mut conn: Option<Conn> = None;
     let mut file: Option<File> = None;
     let mut fails = 0u32;
     let mut attempts: std::collections::HashMap<u32, u32> = Default::default();
@@ -338,9 +347,9 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
             q.push_front(f.part);
         }
     };
-    let drop_conn = |conn: &mut Option<RawSender>| {
-        if conn.take().is_some() {
-            ctx.progress.active_conns.fetch_sub(1, Ordering::Relaxed);
+    let drop_conn = |conn: &mut Option<Conn>| {
+        if let Some(c) = conn.take() {
+            ctx.progress.conn_dropped(c.via_media);
         }
     };
 
@@ -361,9 +370,11 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
                     ctx.net.take(ctx.dc, id).await
                 };
                 match conn_res {
-                    Ok(s) => {
-                        ctx.progress.active_conns.fetch_add(1, Ordering::Relaxed);
-                        conn = Some(s);
+                    Ok(c) => {
+                        ctx.progress.conn_acquired(c.via_media);
+                        let counter = if c.via_media { &ctx.media_acquired } else { &ctx.regular_acquired };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        conn = Some(c);
                         last_response = Instant::now();
                     }
                     Err(e) => {
@@ -386,7 +397,7 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
             if file.is_none() {
                 file = Some(open_file(&ctx).await?);
             }
-            let sender = conn.as_mut().unwrap();
+            let sender = &mut conn.as_mut().unwrap().sender;
             let f = file.as_mut().unwrap();
 
             // ---- fill the window ----
@@ -588,12 +599,12 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
     }
     .await;
 
-    if let Some(s) = conn {
-        ctx.progress.active_conns.fetch_sub(1, Ordering::Relaxed);
+    if let Some(c) = conn {
+        ctx.progress.conn_dropped(c.via_media);
         // Healthy connection after a clean finish (nothing in flight) -> keep it warm.
         // Home-DC download connections use the media address: not for the pool.
         if result.is_ok() && inflight.is_empty() && !ctx.is_home_download() {
-            ctx.net.give_back(ctx.dc, id, s);
+            ctx.net.give_back(ctx.dc, id, c);
         }
     }
     result
@@ -725,7 +736,7 @@ pub async fn reupload_part(
     part: u32,
 ) -> Result<()> {
     let req_timeout = Duration::from_secs(net.cfg.transfer.request_timeout_secs);
-    let mut sender = net.take(net.home_dc, 0).await?;
+    let mut sender = net.take(net.home_dc, 0).await?.sender;
     let mut f = File::open(path).await?;
     let mut buf = vec![0u8; plan.len(part) as usize];
     f.seek(SeekFrom::Start(base + plan.offset(part))).await?;

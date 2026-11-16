@@ -155,7 +155,7 @@ pub async fn run(
     // CDN probe: does Telegram redirect this file to a CDN DC (like Telegram
     // Desktop gets with cdn_supported = true)?
     if std::env::var_os("BENCH_CDN_PROBE").is_some() {
-        let mut s = net.open(info.dc, 0).await?;
+        let mut s = net.open(info.dc, 0).await?.sender;
         let r = s
             .invoke(&grammers_tl_types::functions::upload::GetFile {
                 precise: false,

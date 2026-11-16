@@ -19,6 +19,16 @@ pub enum Stage {
     Sending,
 }
 
+/// A finished download or upload stage, for the speed summary.
+struct FinishedStage {
+    is_download: bool,
+    dc: i32,
+    bytes: u64,
+    duration: Duration,
+    /// Connections acquired during the stage: (media, regular).
+    acquired: (usize, usize),
+}
+
 pub struct Progress {
     pub file_name: String,
     pub src_dc: i32,
@@ -26,15 +36,21 @@ pub struct Progress {
     stage: Mutex<(Stage, Instant)>,
     bytes: AtomicU64,
     total: AtomicU64,
-    pub active_conns: AtomicUsize,
+    active_conns: AtomicUsize,
+    /// Active connections opened on the DC's media-only address (≤ active_conns).
+    media_conns: AtomicUsize,
+    /// Connections acquired during the current stage: (media, regular).
+    /// Cleared on every stage change, so callers must enter Downloading /
+    /// Uploading before `transfer::run` acquires connections (bot.rs and
+    /// bench.rs do).
+    stage_acq: Mutex<(usize, usize)>,
     pause_until: Mutex<Option<Instant>>,
     /// Latest per-connection FLOOD hold end (connections with their own
     /// authorization wait individually). Only a hint for the stall watchdog.
     hold_until: Mutex<Option<Instant>>,
     note: Mutex<Option<(String, Instant)>>,
     pub started: Instant,
-    /// Finished transfer stages: (is_download, dc, bytes, duration).
-    finished: Mutex<Vec<(bool, i32, u64, Duration)>>,
+    finished: Mutex<Vec<FinishedStage>>,
     /// (current piece, total pieces) when the file is being split.
     piece: Mutex<Option<(usize, usize)>>,
 }
@@ -49,6 +65,8 @@ impl Progress {
             bytes: AtomicU64::new(0),
             total: AtomicU64::new(size),
             active_conns: AtomicUsize::new(0),
+            media_conns: AtomicUsize::new(0),
+            stage_acq: Mutex::new((0, 0)),
             pause_until: Mutex::new(None),
             hold_until: Mutex::new(None),
             note: Mutex::new(None),
@@ -67,12 +85,15 @@ impl Progress {
                 Stage::Uploading { dc } => Some((false, dc)),
                 _ => None,
             };
-            if let Some((is_dl, dc)) = leaving {
-                let bytes = self.bytes.load(Ordering::Relaxed);
-                self.finished
-                    .lock()
-                    .unwrap()
-                    .push((is_dl, dc, bytes, s.1.elapsed()));
+            let acquired = std::mem::take(&mut *self.stage_acq.lock().unwrap());
+            if let Some((is_download, dc)) = leaving {
+                self.finished.lock().unwrap().push(FinishedStage {
+                    is_download,
+                    dc,
+                    bytes: self.bytes.load(Ordering::Relaxed),
+                    duration: s.1.elapsed(),
+                    acquired,
+                });
             }
             let reset = !matches!((&s.0, &stage), (Stage::Queued { .. }, Stage::Queued { .. }));
             *s = (stage, Instant::now());
@@ -80,6 +101,38 @@ impl Progress {
                 self.bytes.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// A transfer worker got a connection (`media`: opened on the media address).
+    pub fn conn_acquired(&self, media: bool) {
+        self.active_conns.fetch_add(1, Ordering::Relaxed);
+        if media {
+            self.media_conns.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut acq = self.stage_acq.lock().unwrap();
+        if media {
+            acq.0 += 1;
+        } else {
+            acq.1 += 1;
+        }
+    }
+    /// A transfer worker dropped (or returned) a connection from `conn_acquired`.
+    pub fn conn_dropped(&self, media: bool) {
+        if media {
+            self.media_conns.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.active_conns.fetch_sub(1, Ordering::Relaxed);
+    }
+    /// All workers were aborted (their connections dropped without `conn_dropped`).
+    pub fn reset_conns(&self) {
+        self.media_conns.store(0, Ordering::Relaxed);
+        self.active_conns.store(0, Ordering::Relaxed);
+    }
+    pub fn active_conns(&self) -> usize {
+        self.active_conns.load(Ordering::Relaxed)
+    }
+    pub fn media_conns(&self) -> usize {
+        self.media_conns.load(Ordering::Relaxed)
     }
 
     pub fn set_piece(&self, current: usize, total: usize) {
@@ -149,17 +202,28 @@ impl Progress {
             .lock()
             .unwrap()
             .iter()
-            .map(|(is_dl, dc, bytes, d)| {
-                let avg = *bytes as f64 / d.as_secs_f64().max(0.001);
-                let (icon, label) = if *is_dl {
+            .map(|f| {
+                let avg = f.bytes as f64 / f.duration.as_secs_f64().max(0.001);
+                let (icon, label) = if f.is_download {
                     ("📥", "下載")
                 } else {
                     ("📤", "上傳")
                 };
+                let media = if f.is_download {
+                    match f.acquired {
+                        (0, 0) => String::new(),
+                        (0, _) => "（未使用媒體伺服器）".to_string(),
+                        (_, 0) => "（媒體伺服器）".to_string(),
+                        (m, r) => format!("（媒體伺服器 {m}／一般 {r} 條連線）"),
+                    }
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{icon} {label}速度（DC{dc}）：平均 {}/s，用時 {}",
+                    "{icon} {label}速度（DC{}）：平均 {}/s，用時 {}{media}",
+                    f.dc,
                     human_bytes(avg as u64),
-                    human_duration(d.as_secs())
+                    human_duration(f.duration.as_secs())
                 )
             })
             .collect::<Vec<_>>()
@@ -221,10 +285,15 @@ impl Progress {
                 let eta = (total - done) as f64 / avg;
                 out.push_str(&format!("\n⏱ 剩餘時間：{}", human_duration(eta as u64)));
             }
-            out.push_str(&format!(
-                "\n🔗 連線數：{}",
-                self.active_conns.load(Ordering::Relaxed)
-            ));
+            let n = self.active_conns();
+            let media = match (&stage, self.media_conns().min(n)) {
+                (Stage::Uploading { .. }, _) => String::new(),
+                _ if n == 0 => String::new(),
+                (_, 0) => "（一般位址，未使用媒體伺服器）".to_string(),
+                (_, m) if m == n => format!("（媒體伺服器 {m}）"),
+                (_, m) => format!("（媒體伺服器 {m}／一般 {}）", n - m),
+            };
+            out.push_str(&format!("\n🔗 連線數：{n}{media}"));
         }
 
         let summary = self.speed_summary();
@@ -382,5 +451,125 @@ mod tests {
         assert!(s.contains("下載速度（DC4）"), "{s}");
         assert!(s.contains("上傳速度（DC5）"), "{s}");
         assert_eq!(s.lines().count(), 2);
+    }
+
+    fn conn_line(p: &Progress) -> String {
+        p.render(None)
+            .lines()
+            .find(|l| l.starts_with("🔗"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn downloading(media: usize, regular: usize) -> Progress {
+        let p = Progress::new("f".into(), 100, 4, 5);
+        p.set_stage(Stage::Downloading { dc: 4 });
+        for _ in 0..media {
+            p.conn_acquired(true);
+        }
+        for _ in 0..regular {
+            p.conn_acquired(false);
+        }
+        p
+    }
+
+    #[test]
+    fn live_media_indicator_while_downloading() {
+        assert_eq!(
+            conn_line(&downloading(4, 0)),
+            "🔗 連線數：4（媒體伺服器 4）"
+        );
+        assert_eq!(
+            conn_line(&downloading(3, 1)),
+            "🔗 連線數：4（媒體伺服器 3／一般 1）"
+        );
+        assert_eq!(
+            conn_line(&downloading(0, 4)),
+            "🔗 連線數：4（一般位址，未使用媒體伺服器）"
+        );
+        assert_eq!(conn_line(&downloading(0, 0)), "🔗 連線數：0");
+    }
+
+    #[test]
+    fn upload_stage_has_no_media_indicator() {
+        let p = Progress::new("f".into(), 100, 4, 5);
+        p.set_stage(Stage::Uploading { dc: 5 });
+        p.conn_acquired(false);
+        p.conn_acquired(false);
+        assert_eq!(conn_line(&p), "🔗 連線數：2");
+        assert!(!p.render(None).contains("媒體伺服器"));
+    }
+
+    fn download_summary(media: usize, regular: usize) -> String {
+        let p = downloading(media, regular);
+        p.add_bytes(100);
+        p.set_stage(Stage::Uploading { dc: 5 });
+        p.conn_acquired(false);
+        p.add_bytes(100);
+        p.set_stage(Stage::Sending);
+        p.speed_summary()
+    }
+
+    #[test]
+    fn summary_media_suffix_on_download_line_only() {
+        let s = download_summary(4, 0);
+        let (dl, ul) = s.split_once('\n').unwrap();
+        assert!(
+            dl.starts_with("📥") && dl.ends_with("（媒體伺服器）"),
+            "{dl}"
+        );
+        assert!(
+            ul.starts_with("📤") && !ul.contains("媒體伺服器") && !ul.contains("一般"),
+            "{ul}"
+        );
+
+        let s = download_summary(3, 2);
+        assert!(
+            s.lines()
+                .next()
+                .unwrap()
+                .ends_with("（媒體伺服器 3／一般 2 條連線）"),
+            "{s}"
+        );
+
+        let s = download_summary(0, 4);
+        assert!(
+            s.lines().next().unwrap().ends_with("（未使用媒體伺服器）"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn acquisitions_reset_between_stages() {
+        // A media download followed by an upload: the upload's regular
+        // connections must not turn the download into "mixed".
+        let s = download_summary(2, 0);
+        assert!(s.lines().next().unwrap().ends_with("（媒體伺服器）"), "{s}");
+    }
+
+    #[test]
+    fn media_count_never_exceeds_active_and_resets() {
+        let p = downloading(0, 0);
+        let ops: [(bool, bool); 8] = [
+            (true, true),
+            (true, false),
+            (true, true),
+            (false, true),
+            (true, true),
+            (false, false),
+            (true, false),
+            (false, true),
+        ];
+        for (acquire, media) in ops {
+            if acquire {
+                p.conn_acquired(media);
+            } else {
+                p.conn_dropped(media);
+            }
+            assert!(p.media_conns() <= p.active_conns());
+        }
+        assert_eq!((p.active_conns(), p.media_conns()), (2, 1));
+        p.reset_conns();
+        assert_eq!((p.active_conns(), p.media_conns()), (0, 0));
     }
 }
