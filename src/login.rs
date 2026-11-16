@@ -51,7 +51,11 @@ pub async fn login(client: &Client, cfg: &Config) -> Result<()> {
                 cfg.session_file.display()
             );
         }
-        println!("✅ 已經登入：{}（id {}）", me.full_name(), me.id().bare_id_unchecked());
+        println!(
+            "✅ 已經登入：{}（id {}）",
+            me.full_name(),
+            me.id().bare_id_unchecked()
+        );
         return Ok(());
     }
 
@@ -78,7 +82,9 @@ pub async fn login(client: &Client, cfg: &Config) -> Result<()> {
                 let mut tries = 0;
                 break loop {
                     let hint = password_token.hint().unwrap_or("無").to_string();
-                    let pw = prompt_hidden(&format!("此帳號已啟用兩步驟驗證，請輸入密碼（提示：{hint}）："))?;
+                    let pw = prompt_hidden(&format!(
+                        "此帳號已啟用兩步驟驗證，請輸入密碼（提示：{hint}）："
+                    ))?;
                     match client.check_password(password_token, pw.trim()).await {
                         Ok(user) => break user,
                         Err(SignInError::InvalidPassword(t)) if tries < 2 => {

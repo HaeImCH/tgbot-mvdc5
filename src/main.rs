@@ -134,7 +134,9 @@ async fn main() -> Result<()> {
     );
     if cfg.account == AccountType::User {
         if cfg.allowed_user_ids.is_empty() {
-            info!("user mode: only files you send/forward to your own Saved Messages are processed");
+            info!(
+                "user mode: only files you send/forward to your own Saved Messages are processed"
+            );
         } else {
             info!(
                 "user mode: processing Saved Messages and private chats from {:?}",
@@ -195,7 +197,9 @@ async fn main() -> Result<()> {
                     Ok(Ok(_)) => fails = 0,
                     other => {
                         fails += 1;
-                        warn!("home DC health check failed ({fails}): {other:?}; forcing reconnect");
+                        warn!(
+                            "home DC health check failed ({fails}): {other:?}; forcing reconnect"
+                        );
                         handle.disconnect_from_dc(home_dc);
                     }
                 }
@@ -254,7 +258,11 @@ fn sweep_temp_dir(dir: &std::path::Path) {
         }
     }
     if n > 0 {
-        info!("removed {n} leftover temp file(s) ({}) from {}", status::human_bytes(bytes), dir.display());
+        info!(
+            "removed {n} leftover temp file(s) ({}) from {}",
+            status::human_bytes(bytes),
+            dir.display()
+        );
     }
 }
 

@@ -120,7 +120,10 @@ impl Progress {
     }
     /// True while at least one connection is in a FLOOD_WAIT hold.
     pub fn holding(&self) -> bool {
-        self.hold_until.lock().unwrap().is_some_and(|t| t > Instant::now())
+        self.hold_until
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t > Instant::now())
     }
 
     pub async fn wait_pause(&self) {
@@ -148,7 +151,11 @@ impl Progress {
             .iter()
             .map(|(is_dl, dc, bytes, d)| {
                 let avg = *bytes as f64 / d.as_secs_f64().max(0.001);
-                let (icon, label) = if *is_dl { ("📥", "下載") } else { ("📤", "上傳") };
+                let (icon, label) = if *is_dl {
+                    ("📥", "下載")
+                } else {
+                    ("📤", "上傳")
+                };
                 format!(
                     "{icon} {label}速度（DC{dc}）：平均 {}/s，用時 {}",
                     human_bytes(avg as u64),
@@ -163,7 +170,9 @@ impl Progress {
         let (stage, since) = self.stage();
         let mut out = String::new();
         let header = match &stage {
-            Stage::Queued { ahead } if *ahead > 0 => format!("⏳ 排隊中（前面還有 {ahead} 個任務）"),
+            Stage::Queued { ahead } if *ahead > 0 => {
+                format!("⏳ 排隊中（前面還有 {ahead} 個任務）")
+            }
             Stage::Queued { .. } => "⏳ 排隊中…".to_string(),
             Stage::Connecting { dc } => format!("🔌 正在連線到 DC{dc} 並取得授權…"),
             Stage::Downloading { dc } => format!("📥 正在從 DC{dc} 下載"),
@@ -225,7 +234,9 @@ impl Progress {
 
         if let Some(until) = self.paused_until() {
             let secs = until.saturating_duration_since(Instant::now()).as_secs() + 1;
-            out.push_str(&format!("\n\n🚦 觸發 Telegram 限流，暫停中，約 {secs} 秒後繼續"));
+            out.push_str(&format!(
+                "\n\n🚦 觸發 Telegram 限流，暫停中，約 {secs} 秒後繼續"
+            ));
         } else if let Some(note) = self.current_note() {
             out.push_str(&format!("\n\n⚠️ {note}"));
         }

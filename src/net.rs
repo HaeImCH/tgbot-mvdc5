@@ -103,7 +103,12 @@ impl Net {
         };
         let mut found = HashMap::new();
         for tl::enums::DcOption::Option(o) in conf.dc_options {
-            if !o.media_only || o.cdn || o.tcpo_only || o.ipv6 != self.cfg.use_ipv6 || found.contains_key(&o.id) {
+            if !o.media_only
+                || o.cdn
+                || o.tcpo_only
+                || o.ipv6 != self.cfg.use_ipv6
+                || found.contains_key(&o.id)
+            {
                 continue;
             }
             let ip: std::net::IpAddr = match o.ip_address.parse() {
@@ -114,7 +119,14 @@ impl Net {
         }
         let mut list: Vec<_> = found.iter().map(|(dc, a)| format!("DC{dc}={a}")).collect();
         list.sort();
-        info!("media DC addresses: {}", if list.is_empty() { "none".into() } else { list.join(", ") });
+        info!(
+            "media DC addresses: {}",
+            if list.is_empty() {
+                "none".into()
+            } else {
+                list.join(", ")
+            }
+        );
         *self.media.write().unwrap() = found;
     }
 
@@ -122,7 +134,9 @@ impl Net {
     /// downloads (`reupload_same_dc`); uploads go to the regular address like
     /// the official clients do.
     fn media_addr(&self, dc_id: i32, download: bool) -> Option<SocketAddr> {
-        if (dc_id == self.home_dc && !download) || self.media_broken.lock().unwrap().contains(&dc_id) {
+        if (dc_id == self.home_dc && !download)
+            || self.media_broken.lock().unwrap().contains(&dc_id)
+        {
             return None;
         }
         self.media.read().unwrap().get(&dc_id).copied()
@@ -156,7 +170,10 @@ impl Net {
         })
     }
 
-    fn init<Q>(&self, query: Q) -> tl::functions::InvokeWithLayer<tl::functions::InitConnection<Q>> {
+    fn init<Q>(
+        &self,
+        query: Q,
+    ) -> tl::functions::InvokeWithLayer<tl::functions::InitConnection<Q>> {
         tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
             query: tl::functions::InitConnection {
@@ -203,19 +220,28 @@ impl Net {
 
         let mut last_err = None;
         for attempt in 1..=4u64 {
-            match timeout(self.connect_timeout() * 2, self.create_authorized_key(dc_id)).await {
+            match timeout(
+                self.connect_timeout() * 2,
+                self.create_authorized_key(dc_id),
+            )
+            .await
+            {
                 Ok(Ok(key)) => {
                     info!("DC{dc_id}: authorization imported (slot {slot})");
                     keys.insert((dc_id, slot), key);
                     return Ok(key);
                 }
                 Ok(Err(e)) => {
-                    warn!("DC{dc_id}: export/import authorization failed (slot {slot}, attempt {attempt}): {e:#}");
+                    warn!(
+                        "DC{dc_id}: export/import authorization failed (slot {slot}, attempt {attempt}): {e:#}"
+                    );
                     // Respect FLOOD_WAIT on exportAuthorization instead of hammering.
-                    let flood = e.chain().find_map(|c| match c.downcast_ref::<InvocationError>() {
-                        Some(InvocationError::Rpc(r)) if r.code == 420 => r.value,
-                        _ => None,
-                    });
+                    let flood = e
+                        .chain()
+                        .find_map(|c| match c.downcast_ref::<InvocationError>() {
+                            Some(InvocationError::Rpc(r)) if r.code == 420 => r.value,
+                            _ => None,
+                        });
                     last_err = Some(e);
                     if let Some(secs) = flood {
                         if secs > 120 {
@@ -226,7 +252,9 @@ impl Net {
                     }
                 }
                 Err(_) => {
-                    warn!("DC{dc_id}: export/import authorization timed out (slot {slot}, attempt {attempt})");
+                    warn!(
+                        "DC{dc_id}: export/import authorization timed out (slot {slot}, attempt {attempt})"
+                    );
                     last_err = Some(anyhow!("取得授權逾時"));
                 }
             }
@@ -331,7 +359,9 @@ impl Net {
                 let mut set = tokio::task::JoinSet::new();
                 for (slot, mut s) in taken {
                     set.spawn(async move {
-                        let ping = tl::functions::Ping { ping_id: rand::random() };
+                        let ping = tl::functions::Ping {
+                            ping_id: rand::random(),
+                        };
                         match timeout(ping_timeout, s.invoke(&ping)).await {
                             Ok(Ok(_)) => Some((slot, s)),
                             _ => None,
@@ -401,7 +431,9 @@ impl Net {
         match self.open_at(dc_id, key, via_media).await {
             Err(e) if via_media && e.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc()) => {
                 if self.media_broken.lock().unwrap().insert(dc_id) {
-                    warn!("DC{dc_id}: media address failed ({e:#}); falling back to the regular address");
+                    warn!(
+                        "DC{dc_id}: media address failed ({e:#}); falling back to the regular address"
+                    );
                 }
                 self.open_at(dc_id, key, false).await
             }

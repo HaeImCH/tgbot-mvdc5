@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use grammers_mtsender::InvocationError;
 use grammers_mtproto::transport;
+use grammers_mtsender::InvocationError;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -283,7 +283,11 @@ pub async fn run(
     let secs = started.elapsed().as_secs_f64().max(0.001);
     info!(
         "DC{dc} {}: {} in {secs:.1}s ({:.2} MB/s), {conns} conn(s), {reqs} requests (avg {:.0} ms), {} FLOOD_WAIT, separate auth: {}",
-        if matches!(ctx.dir, Direction::Download { .. }) { "download" } else { "upload" },
+        if matches!(ctx.dir, Direction::Download { .. }) {
+            "download"
+        } else {
+            "upload"
+        },
         crate::status::human_bytes(plan.size),
         plan.size as f64 / secs / 1048576.0,
         ctx.request_micros.load(Ordering::Relaxed) as f64 / reqs.max(1) as f64 / 1000.0,
@@ -659,7 +663,12 @@ async fn build_request(ctx: &Ctx, file: &mut File, part: u32) -> Result<(Vec<u8>
 }
 
 /// Validate a successful response for `part` (and write downloaded data).
-async fn handle_response(ctx: &Ctx, file: &mut File, part: u32, body: &[u8]) -> Result<u64, PartErr> {
+async fn handle_response(
+    ctx: &Ctx,
+    file: &mut File,
+    part: u32,
+    body: &[u8],
+) -> Result<u64, PartErr> {
     let plan = ctx.plan;
     let offset = plan.offset(part);
     let expected = plan.len(part);
@@ -834,6 +843,9 @@ mod tests {
     fn upload_limit() {
         let max = MAX_UPLOAD_PARTS * UPLOAD_PART;
         assert_eq!(Plan::new(max, UPLOAD_PART).parts as u64, MAX_UPLOAD_PARTS);
-        assert_eq!(Plan::new(max + 1, UPLOAD_PART).parts as u64, MAX_UPLOAD_PARTS + 1);
+        assert_eq!(
+            Plan::new(max + 1, UPLOAD_PART).parts as u64,
+            MAX_UPLOAD_PARTS + 1
+        );
     }
 }

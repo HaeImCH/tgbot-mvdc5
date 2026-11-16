@@ -224,14 +224,17 @@ impl Config {
         // grammers rejects (panics on) any MTProto message >= ~1 MB, and a 1024 KB
         // getFile response is 1 MB of data + headers, so 512 KB is the real maximum.
         if kb == 0 || kb > 512 || !kb.is_multiple_of(4) || !1024u32.is_multiple_of(kb) {
-            bail!("download_chunk_kb must be a multiple of 4 that divides 1024 and is <= 512 (e.g. 128, 256, 512)");
+            bail!(
+                "download_chunk_kb must be a multiple of 4 that divides 1024 and is <= 512 (e.g. 128, 256, 512)"
+            );
         }
-        if t.request_timeout_secs == 0 || t.connect_timeout_secs == 0 || t.stall_timeout_secs == 0
-        {
+        if t.request_timeout_secs == 0 || t.connect_timeout_secs == 0 || t.stall_timeout_secs == 0 {
             bail!("timeouts must be > 0");
         }
         if t.stall_timeout_secs <= t.connect_timeout_secs + t.request_timeout_secs {
-            bail!("stall_timeout_secs must be greater than connect_timeout_secs + request_timeout_secs");
+            bail!(
+                "stall_timeout_secs must be greater than connect_timeout_secs + request_timeout_secs"
+            );
         }
         let w = &self.warm;
         if w.enabled {
@@ -243,7 +246,9 @@ impl Config {
             }
         }
         if !(1..=4000).contains(&t.split_size_mb) {
-            bail!("split_size_mb must be 1..=4000 (it is also capped at runtime to the account's upload limit)");
+            bail!(
+                "split_size_mb must be 1..=4000 (it is also capped at runtime to the account's upload limit)"
+            );
         }
         if !(1..=32).contains(&t.pipeline_depth) {
             bail!("pipeline_depth must be 1..=32");

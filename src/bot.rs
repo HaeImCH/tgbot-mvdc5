@@ -15,9 +15,9 @@ use grammers_tl_types as tl;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::config::AccountType;
 use crate::net::Net;
 use crate::status::{self, Progress, Stage, human_bytes, human_duration};
-use crate::config::AccountType;
 use crate::transfer::{self, BIG_FILE, Direction, Location, Plan, UPLOAD_PART};
 
 pub struct Bot {
@@ -99,11 +99,16 @@ fn parse_link(text: &str) -> Option<MsgLink> {
     let middle = &parts[1..parts.len() - 1];
     if name == "c" {
         // c/<channel>/<id> or c/<channel>/<topic>/<id>
-        let [channel, rest @ ..] = middle else { return None };
+        let [channel, rest @ ..] = middle else {
+            return None;
+        };
         if rest.len() > 1 || rest.iter().any(|p| p.parse::<i32>().is_err()) {
             return None;
         }
-        return Some(MsgLink::Private { channel: channel.parse().ok()?, id });
+        return Some(MsgLink::Private {
+            channel: channel.parse().ok()?,
+            id,
+        });
     }
     // <username>/<id> or <username>/<topic>/<id>
     let valid = name.len() >= 4
@@ -112,7 +117,10 @@ fn parse_link(text: &str) -> Option<MsgLink> {
     if !valid || middle.len() > 1 || middle.iter().any(|p| p.parse::<i32>().is_err()) {
         return None;
     }
-    Some(MsgLink::Public { username: name.to_string(), id })
+    Some(MsgLink::Public {
+        username: name.to_string(),
+        id,
+    })
 }
 
 /// What we know about the incoming file.
@@ -213,14 +221,25 @@ impl Bot {
             return;
         }
         info!("shutdown: interrupting {} unfinished job(s)", jobs.len());
-        for (_, ActiveJob { peer, status_id, tmp, job, .. }) in jobs {
+        for (
+            _,
+            ActiveJob {
+                peer,
+                status_id,
+                tmp,
+                job,
+                ..
+            },
+        ) in jobs
+        {
             info!("shutdown: interrupted {job}");
             match tokio::fs::remove_file(&tmp).await {
                 Ok(()) => info!("shutdown: removed {}", tmp.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => warn!("shutdown: cannot remove {}: {e}", tmp.display()),
             }
-            let text = "⚠️ 服務正在重新啟動，此任務已中斷，暫存檔已清除。\n\n請稍後重新轉傳檔案再試一次。";
+            let text =
+                "⚠️ 服務正在重新啟動，此任務已中斷，暫存檔已清除。\n\n請稍後重新轉傳檔案再試一次。";
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 status::edit(&self.net.client, peer, status_id, text, None),
@@ -259,7 +278,11 @@ impl Bot {
             return;
         };
         let n = self.cancel_jobs(q.peer_id(), |id, _| id == source);
-        let text = if n > 0 { "🚫 已取消任務" } else { "此任務已經結束" };
+        let text = if n > 0 {
+            "🚫 已取消任務"
+        } else {
+            "此任務已經結束"
+        };
         if let Err(e) = q.answer().text(text).send().await {
             debug!("cannot answer callback query: {e}");
         }
@@ -325,7 +348,11 @@ impl Bot {
             (false, Some(link)) => match self.fetch_linked(&link).await {
                 Ok(m) => Some(m),
                 Err(e) => {
-                    info!("link {link:?} from {} (message {}): {e:#}", self.requester(&msg), msg.id());
+                    info!(
+                        "link {link:?} from {} (message {}): {e:#}",
+                        self.requester(&msg),
+                        msg.id()
+                    );
                     let _ = msg.reply(format!("⚠️ 無法取得連結中的訊息：{e}")).await;
                     return;
                 }
@@ -384,11 +411,20 @@ impl Bot {
         let home = self.net.home_dc;
         // File names come from the sender: always log them escaped ({:?}) so a
         // name with newlines cannot forge log lines.
-        let mut job = format!("{:?} from {} (message {})", info.name, self.requester(&msg), msg.id());
+        let mut job = format!(
+            "{:?} from {} (message {})",
+            info.name,
+            self.requester(&msg),
+            msg.id()
+        );
         if linked.is_some() {
             job.push_str(&format!(" via link {text:?}"));
         }
-        info!("file request: {job}, {} on DC{}", human_bytes(info.size), info.dc);
+        info!(
+            "file request: {job}, {} on DC{}",
+            human_bytes(info.size),
+            info.dc
+        );
         if info.dc == home && !self.net.cfg.transfer.reupload_same_dc {
             // Our own re-uploaded files are already filtered out in accept() (they
             // reply to a source we are moving), so it is safe to answer here.
@@ -479,14 +515,20 @@ impl Bot {
         // Queue.
         let waiting_before = self.waiting.fetch_add(1, Ordering::SeqCst);
         let running = self.net.cfg.transfer.max_concurrent_jobs - self.jobs.available_permits();
-        let ahead = if self.jobs.available_permits() == 0 { waiting_before + running } else { 0 };
+        let ahead = if self.jobs.available_permits() == 0 {
+            waiting_before + running
+        } else {
+            0
+        };
         progress.set_stage(Stage::Queued { ahead });
         let work = async {
             let permit = {
                 let _waiting = Waiting(&self.waiting);
                 self.jobs.acquire().await
             };
-            let result = self.process(&msg, src, src_peer, peer, info, &tmp, &progress).await;
+            let result = self
+                .process(&msg, src, src_peer, peer, info, &tmp, &progress)
+                .await;
             drop(permit);
             result
         };
@@ -519,8 +561,11 @@ impl Bot {
                     Some(dc) => format!("DC{dc}, expected DC{home}"),
                     None => "unknown DC".to_string(),
                 };
-                outcome = format!("job done: {job} delivered in {elapsed} ({pieces} piece(s), now on {location})");
-                let avg = progress.total() as f64 / progress.started.elapsed().as_secs_f64().max(0.001);
+                outcome = format!(
+                    "job done: {job} delivered in {elapsed} ({pieces} piece(s), now on {location})"
+                );
+                let avg =
+                    progress.total() as f64 / progress.started.elapsed().as_secs_f64().max(0.001);
                 let where_now = match done.new_dc {
                     Some(dc) if dc == home && done.all_same_dc => format!("✅ 新檔案已位於 DC{dc}"),
                     Some(_) if !done.all_same_dc => "⚠️ 各部分位於不同的 DC".to_string(),
@@ -565,7 +610,9 @@ impl Bot {
                     edited = true;
                     break;
                 }
-                status::EditResult::Flood(s) => tokio::time::sleep(Duration::from_secs(s.min(30))).await,
+                status::EditResult::Flood(s) => {
+                    tokio::time::sleep(Duration::from_secs(s.min(30))).await
+                }
                 status::EditResult::Err => tokio::time::sleep(Duration::from_secs(2)).await,
             }
         }
@@ -642,8 +689,12 @@ impl Bot {
             );
         }
         {
-            let f = tokio::fs::File::create(tmp).await.context("無法建立暫存檔")?;
-            f.set_len(info.size).await.context("磁碟空間不足或無法配置暫存檔")?;
+            let f = tokio::fs::File::create(tmp)
+                .await
+                .context("無法建立暫存檔")?;
+            f.set_len(info.size)
+                .await
+                .context("磁碟空間不足或無法配置暫存檔")?;
         }
 
         // ---- download from source DC ----
@@ -714,7 +765,12 @@ impl Bot {
         let ranges = transfer::split_ranges(real_size, piece_size);
         let split = ranges.len() > 1;
         if split {
-            info!("{:?} is {}, splitting into {} pieces", info.name, human_bytes(real_size), ranges.len());
+            info!(
+                "{:?} is {}, splitting into {} pieces",
+                info.name,
+                human_bytes(real_size),
+                ranges.len()
+            );
         }
         let mut uploaded = Vec::with_capacity(ranges.len());
         for (i, &(base, len)) in ranges.iter().enumerate() {
@@ -763,65 +819,71 @@ impl Bot {
         for (i, piece) in uploaded.iter().enumerate() {
             progress.set_piece(i + 1, total);
             let input_file = piece.input_file();
-            let (media, text, ents): (tl::enums::InputMedia, String, Vec<tl::enums::MessageEntity>) =
-                if !split {
-                    let media = match &info.kind {
-                        FileKind::Photo => tl::types::InputMediaUploadedPhoto {
-                            spoiler: false,
-                            live_photo: false,
-                            file: input_file,
-                            stickers: None,
-                            ttl_seconds: None,
-                            video: None,
-                        }
-                        .into(),
-                        FileKind::Document { mime, attributes } => {
-                            tl::types::InputMediaUploadedDocument {
-                                nosound_video: false,
-                                force_file: false,
-                                spoiler: false,
-                                file: input_file,
-                                thumb: None,
-                                mime_type: mime.clone(),
-                                attributes: attributes.clone(),
-                                stickers: None,
-                                ttl_seconds: None,
-                                video_cover: None,
-                                video_timestamp: None,
-                            }
-                            .into()
-                        }
-                    };
-                    (media, caption.clone(), entities.clone())
-                } else {
-                    // Pieces are raw byte ranges: send as plain files.
-                    let media = tl::types::InputMediaUploadedDocument {
-                        nosound_video: false,
-                        force_file: true,
+            let (media, text, ents): (
+                tl::enums::InputMedia,
+                String,
+                Vec<tl::enums::MessageEntity>,
+            ) = if !split {
+                let media = match &info.kind {
+                    FileKind::Photo => tl::types::InputMediaUploadedPhoto {
                         spoiler: false,
+                        live_photo: false,
                         file: input_file,
-                        thumb: None,
-                        mime_type: "application/octet-stream".into(),
-                        attributes: vec![
-                            tl::types::DocumentAttributeFilename {
-                                file_name: piece.name.clone(),
-                            }
-                            .into(),
-                        ],
                         stickers: None,
                         ttl_seconds: None,
-                        video_cover: None,
-                        video_timestamp: None,
+                        video: None,
                     }
-                    .into();
-                    let suffix = format!("🧩 {}（第 {}/{} 部分）", info.name, i + 1, total);
-                    // Keep the original caption on the first piece if it fits (1024 limit).
-                    if i == 0 && !caption.is_empty() && caption.encode_utf16().count() + suffix.encode_utf16().count() + 2 <= 1024 {
-                        (media, format!("{caption}\n\n{suffix}"), entities.clone())
-                    } else {
-                        (media, suffix, Vec::new())
+                    .into(),
+                    FileKind::Document { mime, attributes } => {
+                        tl::types::InputMediaUploadedDocument {
+                            nosound_video: false,
+                            force_file: false,
+                            spoiler: false,
+                            file: input_file,
+                            thumb: None,
+                            mime_type: mime.clone(),
+                            attributes: attributes.clone(),
+                            stickers: None,
+                            ttl_seconds: None,
+                            video_cover: None,
+                            video_timestamp: None,
+                        }
+                        .into()
                     }
                 };
+                (media, caption.clone(), entities.clone())
+            } else {
+                // Pieces are raw byte ranges: send as plain files.
+                let media = tl::types::InputMediaUploadedDocument {
+                    nosound_video: false,
+                    force_file: true,
+                    spoiler: false,
+                    file: input_file,
+                    thumb: None,
+                    mime_type: "application/octet-stream".into(),
+                    attributes: vec![
+                        tl::types::DocumentAttributeFilename {
+                            file_name: piece.name.clone(),
+                        }
+                        .into(),
+                    ],
+                    stickers: None,
+                    ttl_seconds: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                }
+                .into();
+                let suffix = format!("🧩 {}（第 {}/{} 部分）", info.name, i + 1, total);
+                // Keep the original caption on the first piece if it fits (1024 limit).
+                if i == 0
+                    && !caption.is_empty()
+                    && caption.encode_utf16().count() + suffix.encode_utf16().count() + 2 <= 1024
+                {
+                    (media, format!("{caption}\n\n{suffix}"), entities.clone())
+                } else {
+                    (media, suffix, Vec::new())
+                }
+            };
             let sent = self
                 .send_with_retry(peer, msg_id, media, text, ents, piece, tmp, progress)
                 .await
@@ -839,7 +901,10 @@ impl Bot {
             new_dc: new_dcs.first().copied().flatten(),
             all_same_dc: new_dcs.windows(2).all(|w| w[0] == w[1]),
             pieces: if split {
-                uploaded.iter().map(|p| (p.name.clone(), p.plan.size)).collect()
+                uploaded
+                    .iter()
+                    .map(|p| (p.name.clone(), p.plan.size))
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -898,7 +963,13 @@ impl Bot {
                     warn!("server reports part {part} missing, re-uploading");
                     progress.note(format!("伺服器回報缺少分塊 {part}，重新上傳中"));
                     transfer::reupload_part(
-                        &self.net, piece.plan, piece.file_id, piece.big, piece.base, tmp, part,
+                        &self.net,
+                        piece.plan,
+                        piece.file_id,
+                        piece.big,
+                        piece.base,
+                        tmp,
+                        part,
                     )
                     .await?;
                 }
@@ -1059,25 +1130,54 @@ mod tests {
             2000 * 1024 * 1024,
         );
         assert!(t.contains("2 個部分"));
-        assert!(t.contains(r#"cat "a b.mkv.001" "a b.mkv.002" > "a b.mkv""#), "{t}");
-        assert!(t.contains(r#"copy /b "a b.mkv.001"+"a b.mkv.002" "a b.mkv""#), "{t}");
+        assert!(
+            t.contains(r#"cat "a b.mkv.001" "a b.mkv.002" > "a b.mkv""#),
+            "{t}"
+        );
+        assert!(
+            t.contains(r#"copy /b "a b.mkv.001"+"a b.mkv.002" "a b.mkv""#),
+            "{t}"
+        );
         assert_eq!(split_instructions("x", &[], 1), "");
     }
 
     #[test]
     fn message_links() {
-        let public = |u: &str, id| Some(MsgLink::Public { username: u.into(), id });
-        assert_eq!(parse_link("https://t.me/testnoforward/2"), public("testnoforward", 2));
-        assert_eq!(parse_link(" t.me/testnoforward/2?single "), public("testnoforward", 2));
-        assert_eq!(parse_link("https://t.me/s/testnoforward/2"), public("testnoforward", 2));
-        assert_eq!(parse_link("https://telegram.me/some_chan/10/25"), public("some_chan", 25));
+        let public = |u: &str, id| {
+            Some(MsgLink::Public {
+                username: u.into(),
+                id,
+            })
+        };
+        assert_eq!(
+            parse_link("https://t.me/testnoforward/2"),
+            public("testnoforward", 2)
+        );
+        assert_eq!(
+            parse_link(" t.me/testnoforward/2?single "),
+            public("testnoforward", 2)
+        );
+        assert_eq!(
+            parse_link("https://t.me/s/testnoforward/2"),
+            public("testnoforward", 2)
+        );
+        assert_eq!(
+            parse_link("https://telegram.me/some_chan/10/25"),
+            public("some_chan", 25)
+        );
         assert_eq!(
             parse_link("https://t.me/c/1234567890/55"),
-            Some(MsgLink::Private { channel: 1234567890, id: 55 })
+            Some(MsgLink::Private {
+                channel: 1234567890,
+                id: 55
+            })
         );
         assert_eq!(
             parse_link("https://t.me/c/1234567890/3/55"),
-            Some(MsgLink::Private { channel: 1234567890, id: 55 })
+            Some(MsgLink::Private {
+                channel: 1234567890,
+                id: 55
+            })
         );
         assert_eq!(parse_link("https://t.me/testnoforward"), None);
         assert_eq!(parse_link("https://t.me/joinchat/abcdef"), None);

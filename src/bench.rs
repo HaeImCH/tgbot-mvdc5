@@ -40,25 +40,47 @@ pub async fn run(
             .with_context(|| format!("invalid <{name}>"))
     };
     if args.first().is_some_and(|a| a == "upload") {
-        return upload(client, session, cfg, home_dc, me_id, max_upload_parts, &args[1..]).await;
+        return upload(
+            client,
+            session,
+            cfg,
+            home_dc,
+            me_id,
+            max_upload_parts,
+            &args[1..],
+        )
+        .await;
     }
     let msg_id = num(0, "saved_msg_id")? as i32;
     let conns = num(1, "conns")? as usize;
     let depth = num(2, "depth")? as usize;
     let chunk_kb = num(3, "chunk_kb")? as u32;
     let mb = num(4, "mb")?;
-    if chunk_kb == 0 || chunk_kb > 512 || !chunk_kb.is_multiple_of(4) || !1024u32.is_multiple_of(chunk_kb) {
+    if chunk_kb == 0
+        || chunk_kb > 512
+        || !chunk_kb.is_multiple_of(4)
+        || !1024u32.is_multiple_of(chunk_kb)
+    {
         bail!("chunk_kb must be 4..=512, a multiple of 4 dividing 1024");
     }
 
     if std::env::var_os("BENCH_DC_OPTIONS").is_some() {
-        let grammers_tl_types::enums::Config::Config(conf) =
-            client.invoke(&grammers_tl_types::functions::help::GetConfig {}).await?;
+        let grammers_tl_types::enums::Config::Config(conf) = client
+            .invoke(&grammers_tl_types::functions::help::GetConfig {})
+            .await?;
         for o in conf.dc_options {
             let grammers_tl_types::enums::DcOption::Option(o) = o;
             println!(
                 "dc_option DC{} {}:{} ipv6={} media_only={} cdn={} tcpo_only={} static={} this_port_only={}",
-                o.id, o.ip_address, o.port, o.ipv6, o.media_only, o.cdn, o.tcpo_only, o.r#static, o.this_port_only
+                o.id,
+                o.ip_address,
+                o.port,
+                o.ipv6,
+                o.media_only,
+                o.cdn,
+                o.tcpo_only,
+                o.r#static,
+                o.this_port_only
             );
         }
         return Ok(());
@@ -90,12 +112,23 @@ pub async fn run(
         c.transfer.use_media_dc = false;
     }
     let c = Arc::new(c);
-    let net = Arc::new(Net::new(client.clone(), session, c.clone(), home_dc, me_id, max_upload_parts));
+    let net = Arc::new(Net::new(
+        client.clone(),
+        session,
+        c.clone(),
+        home_dc,
+        me_id,
+        max_upload_parts,
+    ));
     net.load_media_dcs().await;
 
     let chunk = chunk_kb as u64 * 1024;
     let size = (mb * 1024 * 1024).min(info.size);
-    let size = if size == info.size { size } else { size / chunk * chunk };
+    let size = if size == info.size {
+        size
+    } else {
+        size / chunk * chunk
+    };
     let dir = std::env::temp_dir().join("tgbot_bench");
     tokio::fs::create_dir_all(&dir).await?;
     let tmp = dir.join(format!("bench_{msg_id}.part"));
@@ -114,7 +147,10 @@ pub async fn run(
     for slot in 0..conns {
         net.auth_key(info.dc, slot).await?;
     }
-    println!("bench: {conns} authorization(s) ready in {:.1}s", t_auth.elapsed().as_secs_f64());
+    println!(
+        "bench: {conns} authorization(s) ready in {:.1}s",
+        t_auth.elapsed().as_secs_f64()
+    );
 
     // CDN probe: does Telegram redirect this file to a CDN DC (like Telegram
     // Desktop gets with cdn_supported = true)?
@@ -137,7 +173,10 @@ pub async fn run(
                 c.file_token.len()
             ),
             Ok(grammers_tl_types::enums::upload::File::File(f)) => {
-                println!("bench: CDN PROBE -> no redirect, served directly ({} bytes)", f.bytes.len())
+                println!(
+                    "bench: CDN PROBE -> no redirect, served directly ({} bytes)",
+                    f.bytes.len()
+                )
             }
             Err(e) => println!("bench: CDN PROBE -> error {e}"),
         }
@@ -206,7 +245,14 @@ async fn upload(
     c.transfer.pipeline_depth = depth;
     c.warm.enabled = false;
     let c = Arc::new(c);
-    let net = Arc::new(Net::new(client, session, c.clone(), home_dc, me_id, max_upload_parts));
+    let net = Arc::new(Net::new(
+        client,
+        session,
+        c.clone(),
+        home_dc,
+        me_id,
+        max_upload_parts,
+    ));
 
     let size = mb * 1024 * 1024;
     let dir = std::env::temp_dir().join("tgbot_bench");
@@ -234,7 +280,11 @@ async fn upload(
         home_dc,
         conns,
         Plan::new(size, transfer::UPLOAD_PART),
-        Direction::Upload { file_id: rand::random(), big: size > transfer::BIG_FILE, base: 0 },
+        Direction::Upload {
+            file_id: rand::random(),
+            big: size > transfer::BIG_FILE,
+            base: 0,
+        },
         tmp.clone(),
         progress,
     )
