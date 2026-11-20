@@ -26,13 +26,14 @@ discussion; loosening it does, and the floor guard flags any loosening.
 | Tests | all pass | `cargo llvm-cov` (one run produces both the test result and coverage) | task | block |
 | Dependencies | no known vulnerability in Cargo.lock (RustSec; unmaintained and yanked are warnings only) | `cargo audit` | task | block |
 | Changed-line coverage | at least 80% of changed lines covered, except W1 | `diff-cover target/lcov.info --fail-under=80` | task | warn until 2026-11-30, then block |
-| Project coverage | at least 17.01% of lines, must not fall | `cargo llvm-cov` + lcov totals | task | warn until 2026-11-30, then block |
+| Project coverage | at least 22.81% of lines, must not fall | `cargo llvm-cov` + lcov totals | task | warn until 2026-11-30, then block |
 | Mutation score | at least 40% of mutants in changed lines caught | `cargo mutants --in-diff` | full | warn until 2026-11-30, then block |
 | Secrets (history) | no findings | `gitleaks git --redact` | full | block |
 
 Why these numbers:
 - **80% of changed lines**: high enough to force a test, low enough to allow a config line or a log message.
 - **Project coverage at least 17.01%**: 17.51% measured today (after `cargo fmt`), minus 0.5 points of tolerance. Most of the code needs a live Telegram connection, so the rule is "must not fall". The tolerance absorbs drift when unrelated code moves. When coverage improves, raise both this row and `COVERAGE_RATCHET` in `scripts/check.sh`.
+- **Raised on 2026-11-21**: the project coverage floor is now at least 22.81% of lines (23.31% measured, minus the same 0.5 points). This supersedes the 17.01% figure in the bullet above, which is kept so the floor guard can see the rule was raised, not removed.
 - **Mutation 40%**: `status.rs`, the best-tested module, scores 39.7% today (58 caught out of 146 viable mutants). The rule holds that line on new code. Raise it as tests improve.
 - **Warn period**: coverage and mutation are new, so they warn for the first two weeks while the floor blocks from day one.
 

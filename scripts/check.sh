@@ -12,8 +12,8 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 
 STAGE="${1:-task}"
 BASE="${BASE:-origin/main}"
-# Measured 2026-11-16 (see CONSTRAINTS.md). Update when the number improves.
-COVERAGE_RATCHET=17.51
+# Measured 2026-11-21 (see CONSTRAINTS.md). Update when the number improves.
+COVERAGE_RATCHET=23.31
 COVERAGE_TOLERANCE=0.5
 CHANGED_LINES_MIN=80
 MUTATION_MIN=40
