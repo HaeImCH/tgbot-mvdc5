@@ -26,8 +26,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grammers_client::Client;
-use grammers_mtproto::{mtp, transport::Full};
-use grammers_mtsender::{InvocationError, Sender, ServerAddr, connect, connect_with_auth};
+use grammers_mtproto::{mtp, transport, transport::Full};
+use grammers_mtsender::{
+    InvocationError, ReadError, Sender, ServerAddr, connect, connect_with_auth,
+};
 use grammers_session::Session;
 use grammers_session::storages::SqliteSession;
 use grammers_tl_types as tl;
@@ -70,6 +72,8 @@ pub struct Net {
     /// DCs whose media address failed while the regular one worked; they use
     /// the regular address until the cooldown ends.
     media_broken: std::sync::Mutex<MediaBackoff>,
+    /// Per-DC cooldown after a transport-level -429, see [`Cooldowns`].
+    cooldowns: std::sync::Mutex<Cooldowns>,
 }
 
 impl Net {
@@ -92,7 +96,38 @@ impl Net {
             idle: std::sync::Mutex::new(HashMap::new()),
             media: std::sync::RwLock::new(HashMap::new()),
             media_broken: std::sync::Mutex::new(MediaBackoff::new(MEDIA_RETRY_AFTER)),
+            cooldowns: std::sync::Mutex::new(Cooldowns::default()),
         }
+    }
+
+    /// Record a transport -429 ("too many connections from this IP") on `dc_id`.
+    /// Returns when new connections to that DC may be opened again.
+    pub fn transport_flood(&self, dc_id: i32) -> Instant {
+        let now = Instant::now();
+        let (until, new_episode) = self.cooldowns.lock().unwrap().hit(dc_id, now);
+        if new_episode {
+            warn!(
+                "DC{dc_id}: transport flood (-429, too many connections from this IP); no new connections for {}s",
+                (until - now).as_secs()
+            );
+        }
+        until
+    }
+
+    /// Wait out any cooldown of `dc_id`. Called right before every dial, so
+    /// every path (workers, warm pool, key creation, media fallback) obeys it.
+    /// Rechecks after waking (a new cooldown may have started) and adds jitter
+    /// so waiting dials do not all fire at the same instant.
+    async fn wait_cooldown(&self, dc_id: i32) {
+        while let Some(t) = self.cooldown_until(dc_id) {
+            let spread = Duration::from_millis(rand::random::<u64>() % 1000);
+            tokio::time::sleep_until((t + spread).into()).await;
+        }
+    }
+
+    /// While `dc_id` cools down after a -429: until when.
+    pub fn cooldown_until(&self, dc_id: i32) -> Option<Instant> {
+        self.cooldowns.lock().unwrap().until(dc_id, Instant::now())
     }
 
     /// Fetch the DC list and remember each DC's media-only address. Failure is
@@ -250,6 +285,17 @@ impl Net {
 
         let mut last_err = None;
         for attempt in 1..=4u64 {
+            // `while`: a new cooldown may start while waiting for the lock again.
+            while self.cooldown_until(dc_id).is_some() {
+                // Wait outside the key lock (it is shared by every DC) and
+                // outside the timeout (a cooldown can be longer than it).
+                drop(keys);
+                self.wait_cooldown(dc_id).await;
+                keys = self.keys.lock().await;
+                if let Some(k) = keys.get(&(dc_id, slot)) {
+                    return Ok(*k);
+                }
+            }
             match timeout(
                 self.connect_timeout() * 2,
                 self.create_authorized_key(dc_id),
@@ -272,6 +318,13 @@ impl Net {
                             Some(InvocationError::Rpc(r)) if r.code == 420 => r.value,
                             _ => None,
                         });
+                    // -429 on the target DC (export errors carry no transport
+                    // status, see create_authorized_key): retrying only adds
+                    // connections. Recorded here so direct callers count too.
+                    if open_error_status(&e) == Some(429) {
+                        self.transport_flood(dc_id);
+                        return Err(e);
+                    }
                     last_err = Some(e);
                     if let Some(secs) = flood {
                         if secs > 120 {
@@ -306,7 +359,12 @@ impl Net {
         )
         .await
         .context("匯出授權逾時")?
-        .context("匯出授權失敗")?;
+        .map_err(|e| match transport_status(&e) {
+            // Export runs on the home DC: its transport error must not start a
+            // cooldown for `dc_id`, so drop the typed error.
+            Some(status) => anyhow!("匯出授權失敗：home DC transport error -{status}"),
+            None => anyhow::Error::new(e).context("匯出授權失敗"),
+        })?;
 
         sender
             .invoke(&self.init(tl::functions::InvokeWithoutUpdates {
@@ -393,16 +451,21 @@ impl Net {
                             ping_id: rand::random(),
                         };
                         match timeout(ping_timeout, s.sender.invoke(&ping)).await {
-                            Ok(Ok(_)) => Some((slot, s)),
-                            _ => None,
+                            Ok(Ok(_)) => Ok((slot, s)),
+                            Ok(Err(e)) => Err(transport_status(&e)),
+                            Err(_) => Err(None),
                         }
                     });
                 }
                 let (mut dead, mut stale) = (0, 0);
                 while let Some(r) = set.join_next().await {
                     match r {
-                        Ok(Some((_, s))) if self.stale(dc, &s) => stale += 1,
-                        Ok(Some((slot, s))) => self.give_back(dc, slot, s),
+                        Ok(Ok((_, s))) if self.stale(dc, &s) => stale += 1,
+                        Ok(Ok((slot, s))) => self.give_back(dc, slot, s),
+                        Ok(Err(Some(429))) => {
+                            self.transport_flood(dc);
+                            dead += 1;
+                        }
                         _ => dead += 1,
                     }
                 }
@@ -413,12 +476,16 @@ impl Net {
                     info!("warm pool DC{dc}: reopening {stale} connection(s) on the media address");
                 }
 
-                // Refill.
-                if !w.dcs.contains(&dc) {
+                // Refill (not while the DC cools down after a -429: new
+                // connections are what triggers it).
+                if !w.dcs.contains(&dc) || self.cooldown_until(dc).is_some() {
                     continue;
                 }
                 let mut opened = 0;
                 for slot in 0..w.connections_per_dc {
+                    if self.cooldown_until(dc).is_some() {
+                        break;
+                    }
                     if self.idle_has(dc, slot) {
                         continue;
                     }
@@ -429,6 +496,9 @@ impl Net {
                         }
                         Err(e) => {
                             warn!("warm pool DC{dc}: cannot open connection: {e:#}");
+                            if open_error_status(&e) == Some(429) {
+                                self.transport_flood(dc);
+                            }
                             break;
                         }
                     }
@@ -487,6 +557,8 @@ impl Net {
 
     async fn open_at(&self, dc_id: i32, key: [u8; 256], media: bool) -> Result<Conn> {
         let (addr, via_media) = self.server_addr(dc_id, media)?;
+        // Outside the connect timeout: a cooldown can be longer than it.
+        self.wait_cooldown(dc_id).await;
         let fut = async {
             let mut sender = connect_with_auth(Full::new(), addr, key).await?;
             // InvokeWithoutUpdates: these raw senders discard updates, so they must
@@ -500,7 +572,12 @@ impl Net {
         };
         match timeout(self.connect_timeout(), fut).await {
             Ok(Ok(sender)) => Ok(Conn { sender, via_media }),
-            Ok(Err(e)) => Err(anyhow::Error::new(OpenError(e))),
+            Ok(Err(e)) => {
+                if transport_status(&e) == Some(429) {
+                    self.transport_flood(dc_id);
+                }
+                Err(anyhow::Error::new(OpenError(e)))
+            }
             Err(_) => bail!("連線到 DC{dc_id} 逾時"),
         }
     }
@@ -538,9 +615,13 @@ fn is_stale(via_media: bool, media_usable: impl FnOnce() -> bool) -> bool {
 }
 
 /// After failing to open on the media address, try the regular one, unless
-/// the server answered with an RPC error (the address itself works then).
+/// the server answered with an RPC error (the address itself works then) or
+/// with a transport -429 (about our IP, not the address: dialing the regular
+/// address right away would add to the flood and mark media broken).
 fn retry_on_regular(via_media: bool, err: &anyhow::Error) -> bool {
-    via_media && err.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc())
+    via_media
+        && open_error_status(err) != Some(429)
+        && err.downcast_ref::<OpenError>().is_none_or(|o| !o.is_rpc())
 }
 
 /// How long a DC stays on its regular address after its media address failed.
@@ -594,6 +675,83 @@ impl MediaBackoff {
     }
 }
 
+/// Status of a transport-level error (negative length from the server: 404 =
+/// auth key unknown, 429 = too many connections from this IP).
+///
+/// grammers reports it as `Deserialize(Transport(BadStatus))`, both from
+/// `Sender::step` and on every pending request; `InvocationError::Transport`
+/// is only used by other code paths, so both shapes are checked.
+pub fn transport_status(e: &InvocationError) -> Option<u32> {
+    match e {
+        InvocationError::Transport(t)
+        | InvocationError::Deserialize(mtp::DeserializeError::Transport(t)) => bad_status(t),
+        _ => None,
+    }
+}
+
+/// [`transport_status`] for an error returned by `Sender::step`.
+pub fn read_status(e: &ReadError) -> Option<u32> {
+    match e {
+        ReadError::Deserialize(mtp::DeserializeError::Transport(t)) => bad_status(t),
+        _ => None,
+    }
+}
+
+/// [`transport_status`] for an error from [`Net::open`] / [`Net::take`].
+/// Also finds an `InvocationError` wrapped with `.context(..)` (key creation).
+pub fn open_error_status(e: &anyhow::Error) -> Option<u32> {
+    e.chain().find_map(|c| {
+        c.downcast_ref::<OpenError>()
+            .map(|o| &o.0)
+            .or_else(|| c.downcast_ref::<InvocationError>())
+            .and_then(transport_status)
+    })
+}
+
+fn bad_status(t: &transport::Error) -> Option<u32> {
+    match t {
+        transport::Error::BadStatus { status } => Some(*status),
+        _ => None,
+    }
+}
+
+/// How long no new connection to a DC is opened after a -429.
+///
+/// Fixed and short on purpose. A prod bench (2026-11-21, DC5) showed the -429s
+/// follow connections the server drops after 1-2.5 s (`read 0 bytes`), not our
+/// reconnect rate: after a 60 s pause the first new connections died the same
+/// way. Escalating cooldowns (2 s up to 60 s) then only idled the workers and
+/// cut throughput from 11.6 to 7.0 MB/s. Two seconds still spreads out the
+/// reconnects of all workers, jobs and the warm pool.
+const COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Per-DC cooldowns after a transport -429 (too many connections from this
+/// IP). During a cooldown no new connection to that DC is opened; existing ones
+/// keep working.
+#[derive(Default)]
+pub struct Cooldowns {
+    until: HashMap<i32, Instant>,
+}
+
+impl Cooldowns {
+    /// Record a -429 at `now`. Returns the end of the cooldown and whether this
+    /// started a new one. Hits during a running cooldown (the other connections
+    /// reporting the same flood) do not extend it.
+    pub fn hit(&mut self, dc_id: i32, now: Instant) -> (Instant, bool) {
+        if let Some(t) = self.until(dc_id, now) {
+            return (t, false);
+        }
+        let until = now + COOLDOWN;
+        self.until.insert(dc_id, until);
+        (until, true)
+    }
+
+    /// End of the running cooldown of `dc_id`, if any.
+    pub fn until(&self, dc_id: i32, now: Instant) -> Option<Instant> {
+        self.until.get(&dc_id).copied().filter(|t| *t > now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +793,10 @@ mod tests {
         assert!(!retry_on_regular(true, &rpc_error()));
         assert!(!retry_on_regular(false, &io_error()));
         assert!(!retry_on_regular(false, &anyhow!("timeout")));
+        let flood = anyhow::Error::new(OpenError(InvocationError::Deserialize(
+            mtp::DeserializeError::Transport(transport::Error::BadStatus { status: 429 }),
+        )));
+        assert!(!retry_on_regular(true, &flood));
     }
 
     #[test]
@@ -686,5 +848,81 @@ mod tests {
             MediaState::Blocked
         );
         assert_eq!(b.state(4, t1 + COOL), MediaState::Retry);
+    }
+
+    fn bad(status: u32) -> transport::Error {
+        transport::Error::BadStatus { status }
+    }
+
+    #[test]
+    fn transport_status_sees_both_shapes() {
+        let nested = InvocationError::Deserialize(mtp::DeserializeError::Transport(bad(429)));
+        assert_eq!(transport_status(&nested), Some(429));
+        assert_eq!(
+            transport_status(&InvocationError::Transport(bad(404))),
+            Some(404)
+        );
+        let other = InvocationError::Transport(transport::Error::BadLen { got: 3 });
+        assert_eq!(transport_status(&other), None);
+        assert_eq!(transport_status(&InvocationError::Dropped("x")), None);
+    }
+
+    #[test]
+    fn read_status_of_step_errors() {
+        let e = ReadError::Deserialize(mtp::DeserializeError::Transport(bad(429)));
+        assert_eq!(read_status(&e), Some(429));
+        let io = ReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "read 0 bytes",
+        ));
+        assert_eq!(read_status(&io), None);
+    }
+
+    #[test]
+    fn open_error_status_unwraps_anyhow() {
+        let e = anyhow::Error::new(OpenError(InvocationError::Deserialize(
+            mtp::DeserializeError::Transport(bad(429)),
+        )))
+        .context("outer");
+        assert_eq!(open_error_status(&e), Some(429));
+        // Key creation wraps the raw InvocationError with .context().
+        let ctx_err = Err::<(), _>(InvocationError::Transport(bad(429)))
+            .context("匯入授權失敗")
+            .unwrap_err();
+        assert_eq!(open_error_status(&ctx_err), Some(429));
+        assert_eq!(open_error_status(&anyhow!("timeout")), None);
+    }
+
+    #[test]
+    fn hits_during_cooldown_do_not_extend_it() {
+        let mut c = Cooldowns::default();
+        let t0 = Instant::now();
+        let (until, new) = c.hit(5, t0);
+        assert!(new);
+        assert_eq!(until, t0 + Duration::from_secs(2));
+        let (again, new) = c.hit(5, t0 + Duration::from_secs(1));
+        assert!(!new);
+        assert_eq!(again, until);
+        assert_eq!(c.until(5, t0 + Duration::from_secs(1)), Some(until));
+        assert_eq!(c.until(5, until), None);
+        assert_eq!(c.until(4, t0), None);
+    }
+
+    #[test]
+    fn repeated_floods_do_not_escalate() {
+        let mut c = Cooldowns::default();
+        let t0 = Instant::now();
+        let (u0, _) = c.hit(5, t0);
+        // Right after it ended and much later: always the same short cooldown.
+        let (u1, new) = c.hit(5, u0);
+        assert!(new);
+        assert_eq!(u1, u0 + COOLDOWN);
+        let later = u1 + Duration::from_secs(600);
+        let (u2, new) = c.hit(5, later);
+        assert!(new);
+        assert_eq!(u2, later + COOLDOWN);
+        // Other DCs are independent.
+        assert_eq!(c.hit(2, t0).0, t0 + COOLDOWN);
+        assert_eq!(c.until(2, t0), Some(t0 + COOLDOWN));
     }
 }

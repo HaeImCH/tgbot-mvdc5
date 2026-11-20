@@ -10,6 +10,8 @@
 //!   does not count paused time as a stall
 //! * FLOOD_PREMIUM_WAIT_X -> rebuild connection (default) or wait
 //! * connection closed / IO -> reconnect with jitter + exponential backoff
+//! * transport -429 (too many connections from this IP) -> DC-wide cooldown in
+//!   `Net`: no new connections to that DC for a short fixed time
 //! * AUTH_KEY_UNREGISTERED -> invalidate the DC key and re-import authorization
 //! * FILE_REFERENCE_* -> refetch the message to refresh the file location
 //! * short/empty response before EOF -> retry the part
@@ -22,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use grammers_mtproto::transport;
 use grammers_mtsender::InvocationError;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tokio::fs::{File, OpenOptions};
@@ -33,7 +34,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::PremiumWaitStrategy;
-use crate::net::{Conn, Net, OpenError};
+use crate::net::{Conn, Net, OpenError, open_error_status, read_status, transport_status};
 use crate::status::Progress;
 
 pub const UPLOAD_PART: u64 = 512 * 1024;
@@ -143,8 +144,11 @@ struct Ctx {
     regular_acquired: AtomicU64,
 }
 
+#[derive(Debug, PartialEq)]
 enum PartErr {
     Flood(u64),
+    /// Transport -429: too many connections from this IP (see `Net::transport_flood`).
+    IpFlood,
     PremiumWait(u64),
     Reconnect(String),
     Reauth(String),
@@ -168,18 +172,31 @@ fn classify(e: InvocationError) -> PartErr {
             PartErr::Retry(r.to_string())
         }
         E::Rpc(r) => PartErr::Fatal(r.to_string()),
-        E::Transport(transport::Error::BadStatus { status: 404 }) => {
+        e if transport_status(&e) == Some(404) => {
             PartErr::Reauth("transport 404 (auth key unknown)".into())
         }
-        E::Transport(transport::Error::BadStatus { status: 429 }) => {
-            PartErr::Flood(3) // too many connections from this IP
-        }
+        e if transport_status(&e) == Some(429) => PartErr::IpFlood,
         e @ (E::Io(_) | E::Transport(_) | E::Deserialize(_) | E::Dropped(_)) => {
             PartErr::Reconnect(e.to_string())
         }
         e @ E::Authentication(_) => PartErr::Reconnect(e.to_string()),
         e @ (E::Session(_) | E::InvalidDc) => PartErr::Fatal(e.to_string()),
     }
+}
+
+/// Start (or join) the DC-wide cooldown after a transport -429 and tell the
+/// watchdog and the user. Returns when new connections may be opened again.
+fn note_ip_flood(ctx: &Ctx) -> Instant {
+    let until = ctx.net.transport_flood(ctx.dc);
+    ctx.progress.hold_hint(until);
+    let secs = until
+        .saturating_duration_since(Instant::now())
+        .as_secs()
+        .max(1);
+    ctx.progress.note(format!(
+        "Telegram 限制同一 IP 的連線數（-429），{secs} 秒內不建立新連線"
+    ));
+    until
 }
 
 fn jitter(max_ms: u64) -> Duration {
@@ -246,7 +263,13 @@ pub async fn run(
                 },
                 _ = tick.tick() => {
                     let b = progress.bytes();
-                    if b != last_bytes || progress.paused_until().is_some() || progress.holding() {
+                    // A DC cooldown (-429) also counts as legitimate idle time:
+                    // workers may be waiting for it inside Net without a hint.
+                    if b != last_bytes
+                        || progress.paused_until().is_some()
+                        || progress.holding()
+                        || ctx.net.cooldown_until(dc).is_some()
+                    {
                         last_bytes = b;
                         last_change = Instant::now();
                     } else if last_change.elapsed() >= stall {
@@ -363,6 +386,16 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
             }
 
             // ---- connection ----
+            if conn.is_none()
+                && let Some(t) = ctx.net.cooldown_until(ctx.dc)
+            {
+                // DC cooling down after a -429. Stagger the workers so they do not
+                // all reconnect at the same instant when it ends.
+                let wake = t + Duration::from_millis(id as u64 * 250) + jitter(tcfg.reconnect_jitter_ms);
+                ctx.progress.hold_hint(wake);
+                tokio::time::sleep_until(wake.into()).await;
+                continue;
+            }
             if conn.is_none() {
                 let conn_res = if ctx.is_home_download() {
                     ctx.net.take_download(ctx.dc, id).await
@@ -385,8 +418,17 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
                         {
                             ctx.net.invalidate(ctx.dc, id).await;
                         }
+                        // Publish a -429 before deciding whether this worker gives up:
+                        // other workers, jobs and the warm pool share the cooldown.
+                        let ip_flood = open_error_status(&e) == Some(429);
+                        if ip_flood {
+                            note_ip_flood(&ctx);
+                        }
                         if fails > tcfg.max_reconnects_per_worker {
                             bail!("無法連線到 DC{}：{e:#}", ctx.dc);
+                        }
+                        if ip_flood {
+                            continue; // the cooldown check above waits
                         }
                         ctx.progress.note(format!("連線 DC{} 失敗，重試中（{fails}）", ctx.dc));
                         tokio::time::sleep(backoff(fails) + jitter(tcfg.reconnect_jitter_ms)).await;
@@ -445,13 +487,19 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
             let oldest = inflight.iter().map(|f| f.started).min().unwrap_or(last_response);
             let deadline = (last_response + req_timeout).min(oldest + req_timeout * 2);
             let stepped = tokio::time::timeout_at(deadline.into(), sender.step()).await;
+            // A transport error from step() fails every request in flight with the
+            // same error, so it is handled here rather than per request.
+            let mut status = None;
             let failure = match stepped {
                 Err(_) => Some(format!(
                     "no response for {}s with {} request(s) in flight",
                     req_timeout.as_secs(),
                     inflight.len()
                 )),
-                Ok(Err(e)) => Some(format!("connection error: {e}")),
+                Ok(Err(e)) => {
+                    status = read_status(&e);
+                    Some(format!("connection error: {e}"))
+                }
                 Ok(Ok(_updates)) => None,
             };
             if let Some(msg) = failure {
@@ -459,8 +507,19 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
                 warn!("{tag}: {msg}; reconnecting and requeueing ({fails})");
                 requeue(&mut inflight);
                 drop_conn(&mut conn);
+                if status == Some(429) {
+                    note_ip_flood(&ctx); // before a possible bail: the cooldown is shared
+                }
                 if fails > tcfg.max_reconnects_per_worker {
                     bail!("DC{} 連線反覆中斷：{msg}", ctx.dc);
+                }
+                match status {
+                    Some(429) => continue, // the cooldown check before connecting waits
+                    Some(404) => {
+                        warn!("{tag}: auth key unknown to DC{}; re-importing authorization", ctx.dc);
+                        ctx.net.invalidate(ctx.dc, id).await;
+                    }
+                    _ => {}
                 }
                 if msg.starts_with("no response") {
                     ctx.progress.note("請求逾時（連線無回應），已重新連線");
@@ -473,6 +532,7 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
             let mut i = 0;
             let mut reconnect: Option<String> = None;
             let mut flood_reconnect = false;
+            let mut ip_flood = false;
             while i < inflight.len() {
                 let res = match inflight[i].rx.try_recv() {
                     Ok(r) => r,
@@ -543,6 +603,10 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
                             PartErr::Reconnect(msg) => {
                                 reconnect.get_or_insert(msg);
                             }
+                            PartErr::IpFlood => {
+                                ip_flood = true;
+                                reconnect.get_or_insert_with(|| "transport flood (-429)".into());
+                            }
                             PartErr::Reauth(msg) => {
                                 let a = attempts.entry(done.part).or_default();
                                 *a += 1;
@@ -590,8 +654,14 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
                 warn!("{tag}: {msg}; reconnecting and requeueing ({fails})");
                 requeue(&mut inflight);
                 drop_conn(&mut conn);
+                if ip_flood {
+                    note_ip_flood(&ctx); // before a possible bail: the cooldown is shared
+                }
                 if fails > tcfg.max_reconnects_per_worker {
                     bail!("DC{} 連線反覆中斷：{msg}", ctx.dc);
+                }
+                if ip_flood {
+                    continue; // the cooldown check before connecting waits
                 }
                 tokio::time::sleep(backoff(fails) + jitter(tcfg.reconnect_jitter_ms)).await;
             }
@@ -614,7 +684,7 @@ async fn worker(id: usize, ctx: Arc<Ctx>, queue: Arc<Mutex<VecDeque<u32>>>) -> R
 fn classify_ref(e: &InvocationError) -> Option<bool> {
     match e {
         InvocationError::Rpc(r) => Some(r.code == 401 || r.name.starts_with("AUTH_KEY")),
-        InvocationError::Transport(transport::Error::BadStatus { status: 404 }) => Some(true),
+        e if transport_status(e) == Some(404) => Some(true),
         _ => None,
     }
 }
@@ -809,6 +879,39 @@ mod tests {
     }
 
     const MB: u64 = 1024 * 1024;
+
+    /// How grammers reports a transport error (negative length) on a request.
+    fn transport_err(status: u32) -> InvocationError {
+        InvocationError::Deserialize(grammers_mtproto::mtp::DeserializeError::Transport(
+            grammers_mtproto::transport::Error::BadStatus { status },
+        ))
+    }
+
+    #[test]
+    fn classify_transport_errors_as_grammers_reports_them() {
+        assert_eq!(classify(transport_err(429)), PartErr::IpFlood);
+        assert!(matches!(classify(transport_err(404)), PartErr::Reauth(_)));
+        assert!(matches!(
+            classify(transport_err(500)),
+            PartErr::Reconnect(_)
+        ));
+        let direct = InvocationError::Transport(grammers_mtproto::transport::Error::BadStatus {
+            status: 429,
+        });
+        assert_eq!(classify(direct), PartErr::IpFlood);
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read 0 bytes");
+        assert!(matches!(
+            classify(InvocationError::Io(eof)),
+            PartErr::Reconnect(_)
+        ));
+    }
+
+    #[test]
+    fn classify_ref_marks_unknown_key() {
+        assert_eq!(classify_ref(&transport_err(404)), Some(true));
+        assert_eq!(classify_ref(&transport_err(429)), None);
+        assert_eq!(classify_ref(&InvocationError::Dropped("x")), None);
+    }
 
     #[test]
     fn plan_exact_multiple() {
