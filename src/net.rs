@@ -35,7 +35,7 @@ use grammers_session::storages::SqliteSession;
 use grammers_tl_types as tl;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
@@ -512,8 +512,10 @@ impl Net {
     }
 
     /// Open a new initialized connection to `dc_id` (bounded by connect timeout).
-    /// Uses the DC's media address when known; if that fails, the DC is marked
-    /// and this and later connections use the regular address.
+    /// Uses the DC's media address when known. If that fails and the regular
+    /// address works, this connection uses the regular one, and the DC is
+    /// blocked from media for a while only when no media connection opened
+    /// within the last minute (see `MediaBackoff::mark`).
     pub async fn open(&self, dc_id: i32, slot: usize) -> Result<Conn> {
         self.open_conn(dc_id, slot, false).await
     }
@@ -533,21 +535,36 @@ impl Net {
         let key = self.auth_key(dc_id, slot).await?;
         let via_media = self.media_addr(dc_id, download).is_some();
         match self.open_at(dc_id, key, via_media).await {
+            Ok(conn) => {
+                if conn.via_media {
+                    // Proof that the media address works (an authenticated
+                    // round trip on the address actually dialed).
+                    let mut backoff = self.media_broken.lock().unwrap();
+                    backoff.ok(dc_id, Instant::now());
+                }
+                Ok(conn)
+            }
             Err(e) if retry_on_regular(via_media, &e) => {
                 let regular = self.open_at(dc_id, key, false).await;
                 // Only blame the media address when the regular one works; if
                 // both fail, the network is down and media stays preferred.
-                if regular.is_ok()
-                    && self
-                        .media_broken
-                        .lock()
-                        .unwrap()
-                        .mark(dc_id, Instant::now())
-                {
-                    warn!(
-                        "DC{dc_id}: media address failed ({e:#}); using the regular address for {}s",
-                        MEDIA_RETRY_AFTER.as_secs()
-                    );
+                if regular.is_ok() {
+                    let outcome = {
+                        let mut backoff = self.media_broken.lock().unwrap();
+                        backoff.mark(dc_id, Instant::now())
+                    };
+                    match outcome {
+                        MarkOutcome::Blocked { last_ok_ago } => warn!(
+                            "DC{dc_id}: media address failed ({e:#}); using the regular address for {}s (last media success: {})",
+                            MEDIA_RETRY_AFTER.as_secs(),
+                            last_ok_text(last_ok_ago)
+                        ),
+                        MarkOutcome::KeptByProof { ago } => debug!(
+                            "DC{dc_id}: media address failed ({e:#}) but worked {}s ago; keeping it",
+                            ago.as_secs()
+                        ),
+                        MarkOutcome::AlreadyBlocked => {}
+                    }
                 }
                 regular
             }
@@ -627,6 +644,28 @@ fn retry_on_regular(via_media: bool, err: &anyhow::Error) -> bool {
 /// How long a DC stays on its regular address after its media address failed.
 const MEDIA_RETRY_AFTER: Duration = Duration::from_secs(300);
 
+/// A media connection that opened this recently proves the media address
+/// works, so a failed connect is not blamed on it (SPEC-media-fallback-proof.md).
+/// Since 2026-11-20 DC5 drops connections after 1-2.5 s; sooner or later a drop
+/// hits a handshake, and one such failure used to block media for 300 s.
+const MEDIA_PROOF_WINDOW: Duration = Duration::from_secs(60);
+
+/// What [`MediaBackoff::mark`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkOutcome {
+    /// A new block started. How long ago media last opened (`None`: never).
+    Blocked { last_ok_ago: Option<Duration> },
+    /// A block is already running; it is not extended.
+    AlreadyBlocked,
+    /// Media opened `ago` ago (within [`MEDIA_PROOF_WINDOW`]): no block.
+    KeptByProof { ago: Duration },
+}
+
+/// "75s ago" / "never", for the block log line.
+fn last_ok_text(ago: Option<Duration>) -> String {
+    ago.map_or_else(|| "never".into(), |a| format!("{}s ago", a.as_secs()))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MediaState {
     /// Not marked: use the media address.
@@ -640,9 +679,15 @@ enum MediaState {
 /// Per-DC cooldown after a media address failure. A failure is often a
 /// passing network problem, so the mark expires instead of lasting until
 /// restart.
+///
+/// Both maps live behind one mutex and callers sample `now` while holding it,
+/// so `ok` and `mark` take effect in lock order: a `mark` before a concurrent
+/// `ok` blocks for the full cooldown, a later `ok` does not end it.
 struct MediaBackoff {
     cooldown: Duration,
     until: HashMap<i32, Instant>,
+    /// When a media connection to the DC last opened successfully.
+    last_ok: HashMap<i32, Instant>,
 }
 
 impl MediaBackoff {
@@ -650,17 +695,33 @@ impl MediaBackoff {
         Self {
             cooldown,
             until: HashMap::new(),
+            last_ok: HashMap::new(),
         }
     }
 
-    /// Mark `dc` as failed at `now`. Returns false if it was already marked
-    /// and still cooling down.
-    fn mark(&mut self, dc: i32, now: Instant) -> bool {
-        let fresh = self.until.get(&dc).is_none_or(|&t| now >= t);
-        if fresh {
-            self.until.insert(dc, now + self.cooldown);
+    /// A media connection to `dc` opened at `now`.
+    fn ok(&mut self, dc: i32, now: Instant) {
+        self.last_ok.insert(dc, now);
+    }
+
+    /// A media connect to `dc` failed at `now` while the regular address
+    /// worked. Blocks media unless it is already blocked or opened within
+    /// [`MEDIA_PROOF_WINDOW`].
+    fn mark(&mut self, dc: i32, now: Instant) -> MarkOutcome {
+        if self.until.get(&dc).is_some_and(|&t| now < t) {
+            return MarkOutcome::AlreadyBlocked;
         }
-        fresh
+        let last_ok_ago = self
+            .last_ok
+            .get(&dc)
+            .map(|&t| now.saturating_duration_since(t));
+        if let Some(ago) = last_ok_ago
+            && ago < MEDIA_PROOF_WINDOW
+        {
+            return MarkOutcome::KeptByProof { ago };
+        }
+        self.until.insert(dc, now + self.cooldown);
+        MarkOutcome::Blocked { last_ok_ago }
     }
 
     fn state(&mut self, dc: i32, now: Instant) -> MediaState {
@@ -809,7 +870,7 @@ mod tests {
     fn marked_dc_is_blocked_until_cooldown_ends() {
         let mut b = MediaBackoff::new(COOL);
         let t0 = Instant::now();
-        assert!(b.mark(4, t0));
+        assert_eq!(b.mark(4, t0), MarkOutcome::Blocked { last_ok_ago: None });
         assert_eq!(b.state(4, t0), MediaState::Blocked);
         assert_eq!(
             b.state(4, t0 + COOL - Duration::from_secs(1)),
@@ -831,8 +892,11 @@ mod tests {
     fn mark_while_blocked_does_not_extend() {
         let mut b = MediaBackoff::new(COOL);
         let t0 = Instant::now();
-        assert!(b.mark(4, t0));
-        assert!(!b.mark(4, t0 + Duration::from_secs(10)));
+        assert_eq!(b.mark(4, t0), MarkOutcome::Blocked { last_ok_ago: None });
+        assert_eq!(
+            b.mark(4, t0 + Duration::from_secs(10)),
+            MarkOutcome::AlreadyBlocked
+        );
         assert_eq!(b.state(4, t0 + COOL), MediaState::Retry);
     }
 
@@ -842,12 +906,83 @@ mod tests {
         let t0 = Instant::now();
         b.mark(4, t0);
         let t1 = t0 + COOL + Duration::from_secs(5);
-        assert!(b.mark(4, t1));
+        assert_eq!(b.mark(4, t1), MarkOutcome::Blocked { last_ok_ago: None });
         assert_eq!(
             b.state(4, t1 + COOL - Duration::from_secs(1)),
             MediaState::Blocked
         );
         assert_eq!(b.state(4, t1 + COOL), MediaState::Retry);
+    }
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn recent_media_success_keeps_media() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.ok(4, t0);
+        let t = t0 + MEDIA_PROOF_WINDOW - SEC;
+        assert_eq!(b.mark(4, t), MarkOutcome::KeptByProof { ago: 59 * SEC });
+        assert_eq!(b.state(4, t), MediaState::Usable);
+    }
+
+    #[test]
+    fn stale_media_success_does_not_prevent_block() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.ok(4, t0);
+        let t = t0 + MEDIA_PROOF_WINDOW;
+        assert_eq!(
+            b.mark(4, t),
+            MarkOutcome::Blocked {
+                last_ok_ago: Some(60 * SEC)
+            }
+        );
+        assert_eq!(b.state(4, t), MediaState::Blocked);
+    }
+
+    #[test]
+    fn success_after_mark_does_not_end_block() {
+        // Lock order mark -> ok: the full cooldown still applies.
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        assert_eq!(b.mark(4, t0), MarkOutcome::Blocked { last_ok_ago: None });
+        b.ok(4, t0 + SEC);
+        assert_eq!(b.state(4, t0 + COOL - SEC), MediaState::Blocked);
+        assert_eq!(b.mark(4, t0 + 2 * SEC), MarkOutcome::AlreadyBlocked);
+        assert_eq!(b.state(4, t0 + COOL), MediaState::Retry);
+        assert_eq!(b.state(4, t0 + COOL), MediaState::Usable);
+    }
+
+    #[test]
+    fn success_before_mark_keeps_media() {
+        // Lock order ok -> mark (same instant): kept.
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.ok(4, t0);
+        assert_eq!(
+            b.mark(4, t0),
+            MarkOutcome::KeptByProof {
+                ago: Duration::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn proof_is_per_dc() {
+        let mut b = MediaBackoff::new(COOL);
+        let t0 = Instant::now();
+        b.ok(2, t0);
+        assert_eq!(b.mark(4, t0), MarkOutcome::Blocked { last_ok_ago: None });
+        assert!(matches!(b.mark(2, t0), MarkOutcome::KeptByProof { .. }));
+        assert_eq!(b.state(2, t0), MediaState::Usable);
+    }
+
+    #[test]
+    fn last_ok_text_formats_age() {
+        assert_eq!(last_ok_text(None), "never");
+        assert_eq!(last_ok_text(Some(75 * SEC)), "75s ago");
+        assert_eq!(last_ok_text(Some(Duration::from_millis(1500))), "1s ago");
     }
 
     fn bad(status: u32) -> transport::Error {
