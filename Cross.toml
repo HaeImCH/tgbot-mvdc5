@@ -1,0 +1,6 @@
+# Pin the build image. cross installed from git defaults to the moving `:main`
+# tag; on 2026-11-21 that was Ubuntu 24.04 (glibc 2.39), and its binaries warn
+# "GLIBC_2.39 not found" on prod (Debian 12, glibc 2.36). The 0.2.5 image is
+# Ubuntu 16.04 (glibc 2.23), so the binary runs on any newer glibc.
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
