@@ -1,6 +1,6 @@
 # Spec Delta: Keep the media address while it demonstrably works
 
-Status: approved (reviewed with Codex for the owner, 2026-11-21)
+Status: implemented (2716b3e, deployed to both prod services 2026-11-20 21:06 UTC; reviewed with Codex for the owner)
 
 ## Objective
 
@@ -121,7 +121,7 @@ so there is no proof and the block happens as before.
 - Requiring several failures before blocking (K-of-N): the proof window covers
   the observed case with less state.
 
-## Results (prod bench, 2026-11-21, bench binary only, not deployed)
+## Results (prod bench, 2026-11-21, bench binary only, before the deploy)
 
 `RUST_LOG=info,tgbot_mvdc5::net=debug bench user.toml 243599 4 8 512 1000`, 3 runs:
 
